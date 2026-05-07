@@ -1,13 +1,3 @@
-"""
-Enhanced 3DS SHBIN / DVLB shader editor
-
-Adds proper DVLP support, safer DVLE parsing, better uniform name mapping,
-JSON/CSV export, JSON import for constants, validation, backups, filtering,
-and a details/hex viewer.
-
-No third-party modules required.
-"""
-
 from __future__ import annotations
 
 import csv
