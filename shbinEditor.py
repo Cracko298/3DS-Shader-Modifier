@@ -820,6 +820,7 @@ class SHBINParser:
         for i, off in enumerate(self.dvle_offsets):
             self.dvles.append(self._parse_dvle(off, i))
 
+        self._annotate_instruction_metadata()
         self._estimate_block_sizes()
 
     def _parse_dvlp(self, offset: int) -> None:
@@ -1040,6 +1041,320 @@ class SHBINParser:
                             c.name = inp.name
                     break
 
+    def _annotate_instruction_metadata(self) -> None:
+        """Attach DVLE symbol/input/label context to decoded DVLP instructions.
+
+        DVLP owns the shared opcode stream, while each DVLE owns a symbol table,
+        input register table, output register table, constant table, and label
+        table. This pass does not change the binary; it only adds human-readable
+        metadata to each decoded instruction field dictionary.
+        """
+        if not self.dvlp:
+            return
+
+        for inst in self.dvlp.instructions:
+            f = inst.fields
+            f["source_line"] = self._source_line_for_instruction(inst.index)
+            f["labels_here"] = []
+            f["entrypoints"] = []
+            f["end_markers"] = []
+            f["active_dvles"] = []
+            f["register_annotations"] = []
+            f["target_annotations"] = []
+            f["annotated_disasm_by_dvle"] = []
+
+        for dvle in self.dvles:
+            for lab in dvle.labels:
+                if 0 <= lab.opcode_address < len(self.dvlp.instructions):
+                    self.dvlp.instructions[lab.opcode_address].fields["labels_here"].append(self._label_annotation(dvle, lab))
+
+            if 0 <= dvle.opcode_entry < len(self.dvlp.instructions):
+                self.dvlp.instructions[dvle.opcode_entry].fields["entrypoints"].append(self._dvle_ref(dvle))
+            if 0 <= dvle.opcode_end < len(self.dvlp.instructions):
+                self.dvlp.instructions[dvle.opcode_end].fields["end_markers"].append(self._dvle_ref(dvle))
+
+            for inst in self.dvlp.instructions:
+                if not self._instruction_in_dvle_range(inst.index, dvle):
+                    continue
+                inst.fields["active_dvles"].append(self._dvle_ref(dvle))
+                ann = self._instruction_annotation_for_dvle(inst, dvle)
+                if ann["registers"]:
+                    inst.fields["register_annotations"].extend(ann["registers"])
+                if ann["targets"]:
+                    inst.fields["target_annotations"].extend(ann["targets"])
+                if ann["annotated_disasm"] != inst.disasm:
+                    inst.fields["annotated_disasm_by_dvle"].append({
+                        "dvle": dvle.index,
+                        "shader_type": dvle.shader_type_name,
+                        "disasm": ann["annotated_disasm"],
+                    })
+                    inst.fields.setdefault("annotated_disasm", ann["annotated_disasm"])
+
+    def _source_line_for_instruction(self, inst_index: int) -> Optional[Dict[str, Any]]:
+        # The DVLP line table used by many SHBINs is parallel to the opcode table.
+        # If the table is shorter/empty, keep the mapping absent rather than lying.
+        if not self.dvlp or inst_index >= len(self.dvlp.lines):
+            return None
+        filename_off, line_num, filename = self.dvlp.lines[inst_index]
+        return {"filename_offset": filename_off, "line": line_num, "filename": filename}
+
+    @staticmethod
+    def _instruction_in_dvle_range(inst_index: int, dvle: DVLEInfo) -> bool:
+        lo, hi = sorted((int(dvle.opcode_entry), int(dvle.opcode_end)))
+        return lo <= inst_index <= hi
+
+    @staticmethod
+    def _dvle_ref(dvle: DVLEInfo) -> Dict[str, Any]:
+        return {
+            "dvle": dvle.index,
+            "shader_type": dvle.shader_type_name,
+            "opcode_entry": dvle.opcode_entry,
+            "opcode_end": dvle.opcode_end,
+        }
+
+    def _label_display_name(self, lab: ShaderLabel) -> str:
+        return lab.name or f"label_{lab.label_id:02X}_{lab.opcode_address:04d}"
+
+    def _label_annotation(self, dvle: DVLEInfo, lab: ShaderLabel) -> Dict[str, Any]:
+        return {
+            "dvle": dvle.index,
+            "label_index": lab.index,
+            "label_id": lab.label_id,
+            "name": self._label_display_name(lab),
+            "opcode_address": lab.opcode_address,
+            "symbol_offset": lab.name_offset,
+        }
+
+    def _labels_at(self, dvle: DVLEInfo, opcode_address: int) -> List[ShaderLabel]:
+        return [lab for lab in dvle.labels if lab.opcode_address == opcode_address]
+
+    def _target_text_for_dvle(self, dvle: DVLEInfo, target: int, targets_out: List[Dict[str, Any]]) -> str:
+        labels = self._labels_at(dvle, int(target))
+        if not labels:
+            return str(target)
+        lab = labels[0]
+        ann = self._label_annotation(dvle, lab)
+        targets_out.append(ann)
+        return f"{target}<{ann['name']}>"
+
+    def _input_symbol_for_register(self, dvle: DVLEInfo, register_number: int) -> Tuple[str, Optional[ShaderInput]]:
+        for inp in dvle.inputs:
+            lo, hi = sorted((inp.start, inp.end))
+            if lo <= register_number <= hi:
+                base = inp.name or f"input_{inp.index}"
+                if hi > lo:
+                    return f"{base}[{register_number - lo}]", inp
+                return base, inp
+        return "", None
+
+    def _constant_for(self, dvle: DVLEInfo, entry_type: int, register_id: int) -> Optional[ShaderConstant]:
+        for c in dvle.constants:
+            if c.entry_type == entry_type and c.register_id == register_id:
+                return c
+        return None
+
+    def _output_for_register(self, dvle: DVLEInfo, register_id: int) -> Optional[ShaderOutput]:
+        for out in dvle.outputs:
+            if out.register_id == register_id:
+                return out
+        return None
+
+    def _dest_symbol_info(self, dvle: DVLEInfo, dst_raw: int) -> Dict[str, Any]:
+        reg_name = pica_dest_reg_name(dst_raw)
+        if dst_raw < 0x10:
+            out = self._output_for_register(dvle, dst_raw)
+            if out:
+                symbol = OUTPUT_TYPES.get(out.output_type, f"output_{out.output_type}")
+                return {
+                    "register": reg_name,
+                    "symbol": symbol,
+                    "kind": "output",
+                    "table": "Output Register Table",
+                    "table_index": out.index,
+                    "mask": component_mask(out.mask),
+                }
+        return {"register": reg_name, "symbol": "", "kind": "temporary" if dst_raw >= 0x10 else "output", "table": "", "table_index": None}
+
+    def _src_symbol_info(self, dvle: DVLEInfo, src_raw: int) -> Dict[str, Any]:
+        reg_name = pica_src_reg_name(src_raw)
+        if src_raw < 0x10:
+            symbol, inp = self._input_symbol_for_register(dvle, src_raw)
+            return {
+                "register": reg_name,
+                "symbol": symbol,
+                "kind": "attribute/input",
+                "table": "Input Register Table" if inp else "",
+                "table_index": inp.index if inp else None,
+                "register_number": src_raw,
+            }
+        if src_raw < 0x20:
+            return {"register": reg_name, "symbol": "", "kind": "temporary", "table": "", "table_index": None, "register_number": src_raw}
+
+        const_id = src_raw - 0x20
+        register_number = FLOAT_REG_BASE + const_id
+        c = self._constant_for(dvle, 2, const_id)
+        input_symbol, inp = self._input_symbol_for_register(dvle, register_number)
+        symbol = ""
+        table = ""
+        table_index: Optional[int] = None
+        if c and c.display_name != c.register_name:
+            symbol = c.display_name
+            table = "Constant Table"
+            table_index = c.index
+        elif input_symbol:
+            symbol = input_symbol
+            table = "Input Register Table"
+            table_index = inp.index if inp else None
+        return {
+            "register": reg_name,
+            "symbol": symbol,
+            "kind": "float uniform/constant",
+            "table": table,
+            "table_index": table_index,
+            "constant_index": c.index if c else None,
+            "input_index": inp.index if inp else None,
+            "register_number": register_number,
+        }
+
+    def _uniform_symbol_info(self, dvle: DVLEInfo, entry_type: int, uniform_id: int) -> Dict[str, Any]:
+        if entry_type == 1:
+            reg_name = f"i{uniform_id}"
+            register_number = INT_REG_BASE + uniform_id
+            kind = "int uniform"
+        else:
+            reg_name = f"b{uniform_id}"
+            register_number = BOOL_REG_BASE + uniform_id
+            kind = "bool uniform"
+        c = self._constant_for(dvle, entry_type, uniform_id)
+        input_symbol, inp = self._input_symbol_for_register(dvle, register_number)
+        symbol = ""
+        table = ""
+        table_index: Optional[int] = None
+        if c and c.display_name != c.register_name:
+            symbol = c.display_name
+            table = "Constant Table"
+            table_index = c.index
+        elif input_symbol:
+            symbol = input_symbol
+            table = "Input Register Table"
+            table_index = inp.index if inp else None
+        return {
+            "register": reg_name,
+            "symbol": symbol,
+            "kind": kind,
+            "table": table,
+            "table_index": table_index,
+            "constant_index": c.index if c else None,
+            "input_index": inp.index if inp else None,
+            "register_number": register_number,
+        }
+
+    @staticmethod
+    def _annotated_register_name(info: Dict[str, Any]) -> str:
+        # Use clean shader symbol names directly in the decoded disassembly.
+        # The raw register is still preserved in the instruction details /
+        # register annotations, so the tree can read like: add r1.xyz, CHUNK_ORIGIN_AND_SCALE.xyzz, r0.xyzz
+        symbol = info.get("symbol") or ""
+        if symbol:
+            return str(symbol)
+        return str(info.get("register", ""))
+
+    def _instruction_annotation_for_dvle(self, inst: ShaderInstruction, dvle: DVLEInfo) -> Dict[str, Any]:
+        f = inst.fields
+        desc = f.get("opdesc", {}) if isinstance(f.get("opdesc"), dict) else {}
+        registers: List[Dict[str, Any]] = []
+        targets: List[Dict[str, Any]] = []
+
+        def record(role: str, info: Dict[str, Any]) -> str:
+            if info.get("symbol") or info.get("table"):
+                rec = {"dvle": dvle.index, "role": role, **info}
+                registers.append(rec)
+            return self._annotated_register_name(info)
+
+        def dst_text() -> str:
+            raw = int(f.get("dst_raw", 0))
+            base = record("dst", self._dest_symbol_info(dvle, raw))
+            mask = str(desc.get("dest_mask", "xyzw"))
+            if mask not in {"-", "xyzw", ""}:
+                base += "." + mask
+            return base
+
+        def src_text(role: str, raw_key: str, neg_key: str, swizzle_key: str) -> str:
+            raw = int(f.get(raw_key, 0))
+            info = self._src_symbol_info(dvle, raw)
+            base = record(role, info)
+            out = ("-" if bool(desc.get(neg_key, False)) else "") + base
+            swizzle = str(desc.get(swizzle_key, "xyzw"))
+            if swizzle and swizzle != "xyzw":
+                out += "." + swizzle
+            return out
+
+        def uniform_text(entry_type: int, uniform_id: int) -> str:
+            info = self._uniform_symbol_info(dvle, entry_type, uniform_id)
+            return record("uniform", info)
+
+        name = inst.mnemonic.lower()
+        op = inst.opcode
+        fmt = inst.fmt
+
+        try:
+            if fmt in {"1", "1u", "1i"}:
+                s1 = src_text("src1", "src1_raw", "src1_neg", "src1_swizzle")
+                if int(f.get("idx", 0)):
+                    s1 += f"[{f.get('idx_name', '?')}]"
+                if op in ARITH_ONE_ARG:
+                    annotated = f"{name} {dst_text()}, {s1}"
+                else:
+                    s2 = src_text("src2", "src2_raw", "src2_neg", "src2_swizzle")
+                    annotated = f"{name} {dst_text()}, {s1}, {s2}"
+                return {"annotated_disasm": annotated, "registers": registers, "targets": targets}
+
+            if fmt == "1c":
+                s1 = src_text("src1", "src1_raw", "src1_neg", "src1_swizzle")
+                s2 = src_text("src2", "src2_raw", "src2_neg", "src2_swizzle")
+                annotated = f"cmp {str(f.get('cmpx_name', f.get('cmpx', 0))).lower()}, {str(f.get('cmpy_name', f.get('cmpy', 0))).lower()}, {s1}, {s2}"
+                return {"annotated_disasm": annotated, "registers": registers, "targets": targets}
+
+            if fmt == "2":
+                target = int(f.get("target", 0))
+                target_s = self._target_text_for_dvle(dvle, target, targets)
+                num = int(f.get("num", 0))
+                condop = str(f.get("condop_name", f.get("condop", 0))).lower()
+                refx = int(f.get("refx", 0))
+                refy = int(f.get("refy", 0))
+                if op == 0x24:
+                    annotated = f"{name} {target_s}, {num}"
+                elif op == 0x23:
+                    annotated = f"{name} {condop} x={refx} y={refy}"
+                else:
+                    annotated = f"{name} {target_s}, {num}, {condop} x={refx} y={refy}"
+                return {"annotated_disasm": annotated, "registers": registers, "targets": targets}
+
+            if fmt == "3":
+                target = int(f.get("target", 0))
+                target_s = self._target_text_for_dvle(dvle, target, targets)
+                num = int(f.get("num", 0))
+                uniform_id = int(f.get("uniform_id", 0))
+                uniform = uniform_text(1 if op == 0x29 else 0, uniform_id)
+                annotated = f"{name} {target_s}, {num}, {uniform}"
+                return {"annotated_disasm": annotated, "registers": registers, "targets": targets}
+
+            if fmt in {"5", "5i"}:
+                s1 = src_text("src1", "src1_raw", "src1_neg", "src1_swizzle")
+                s2 = src_text("src2", "src2_raw", "src2_neg", "src2_swizzle")
+                s3 = src_text("src3", "src3_raw", "src3_neg", "src3_swizzle")
+                if int(f.get("idx", 0)):
+                    if fmt == "5i":
+                        s3 += f"[{f.get('idx_name', '?')}]"
+                    else:
+                        s2 += f"[{f.get('idx_name', '?')}]"
+                annotated = f"{name} {dst_text()}, {s1}, {s2}, {s3}"
+                return {"annotated_disasm": annotated, "registers": registers, "targets": targets}
+        except Exception as exc:
+            self.issues.append(ParseIssue("warning", f"Could not annotate instruction {inst.index} for DVLE {dvle.index}: {exc}"))
+
+        return {"annotated_disasm": inst.disasm, "registers": registers, "targets": targets}
+
     @staticmethod
     def _constant_register_number(entry_type: int, register_id: int) -> Optional[int]:
         if entry_type == 2:
@@ -1061,7 +1376,6 @@ class SHBINParser:
         return f"?{register_id}"
 
     def _estimate_block_sizes(self) -> None:
-        # Estimate block sizes using the next known block offset / EOF. This keeps the hex viewer useful.
         starts: List[Tuple[int, str, Any]] = []
         if self.dvlp:
             starts.append((self.dvlp.offset, "DVLP", self.dvlp))
@@ -1130,13 +1444,42 @@ class SHBINParser:
             raise ValueError("No DVLP program loaded")
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"; Disassembly from {os.path.basename(self.filename)}\n")
-            f.write("; This is intended for patching/reference, not a full reassemblable source.\n\n")
+            f.write("; This is intended for patching/reference, not a full reassemblable source.\n")
+            f.write("; Symbol annotations use reg<symbol> and label target<name> comments.\n\n")
+
+            for dvle in self.dvles:
+                f.write(f"; ---------------- DVLE {dvle.index} ({dvle.shader_type_name}) symbols ----------------\n")
+                f.write(f"; Code range: entry={dvle.opcode_entry}, end={dvle.opcode_end}\n")
+                if dvle.inputs:
+                    f.write("; Input Register Table:\n")
+                    for inp in dvle.inputs:
+                        f.write(f";   [{inp.index:03d}] regs 0x{inp.start:02X}..0x{inp.end:02X} -> {inp.name} (sym_off=0x{inp.name_offset:X})\n")
+                if dvle.outputs:
+                    f.write("; Output Register Table:\n")
+                    for out in dvle.outputs:
+                        type_name = OUTPUT_TYPES.get(out.output_type, f"unknown_{out.output_type}")
+                        f.write(f";   [{out.index:03d}] o{out.register_id} mask={component_mask(out.mask)} -> {type_name}\n")
+                if dvle.labels:
+                    f.write("; Label Table:\n")
+                    for lab in dvle.labels:
+                        f.write(f";   [{lab.index:03d}] {self._label_display_name(lab)}: opcode={lab.opcode_address} id={lab.label_id} sym_off=0x{lab.name_offset:X} unk_b=0x{lab.unknown_b:08X}\n")
+                if dvle.symbols:
+                    f.write("; Symbol Table:\n")
+                    for rel, text in dvle.symbols:
+                        f.write(f";   0x{rel:04X}: {text}\n")
+                f.write("\n")
+
             for inst in self.dvlp.instructions:
-                line = ""
-                for dvle in self.dvles:
-                    if inst.index == dvle.opcode_entry:
-                        line += f"; DVLE {dvle.index} entry ({dvle.shader_type_name})\n"
-                f.write(f"{inst.index:04d}: {inst.disasm:<48} ; word=0x{inst.word:08X} rawop=0x{inst.raw_opcode:02X} fmt={inst.fmt}\n")
+                for lab in inst.fields.get("labels_here", []):
+                    f.write(f"{lab.get('name')}: ; DVLE {lab.get('dvle')} label id={lab.get('label_id')}\n")
+                for ref in inst.fields.get("entrypoints", []):
+                    f.write(f"; DVLE {ref.get('dvle')} entry ({ref.get('shader_type')})\n")
+                source = inst.fields.get("source_line")
+                source_comment = ""
+                if source:
+                    source_comment = f" src={source.get('filename', '')}:{source.get('line', '')}"
+                ann_disasm = inst.fields.get("annotated_disasm", inst.disasm)
+                f.write(f"{inst.index:04d}: {ann_disasm:<64} ; word=0x{inst.word:08X} rawop=0x{inst.raw_opcode:02X} fmt={inst.fmt}{source_comment}\n")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1708,12 +2051,40 @@ class App(tk.Tk):
             self.item_ranges["dvlp_instructions"] = (d.offset + d.opcode_offset, d.opcode_count * 4)
             self.tree.insert(dvlp_item, "end", iid="dvlp_opcodes", text="Raw Opcode Table", values=("Table", f"{d.opcode_count} x 4 bytes"))
             self.item_ranges["dvlp_opcodes"] = (d.offset + d.opcode_offset, d.opcode_count * 4)
+            current_block_parent = None
+            current_block_name = ""
+            current_block_hay = ""
+
             for inst in d.instructions:
-                hay = " ".join([inst.disasm, inst.mnemonic, inst.fmt, f"0x{inst.word:08X}"]).lower()
+                ann_disasm = inst.fields.get("annotated_disasm", inst.disasm)
+                labels_here = ", ".join(x.get("name", "") for x in inst.fields.get("labels_here", []) if x.get("name"))
+
+                if labels_here or current_block_parent is None:
+                    current_block_name = labels_here or f"entry_{inst.index:04d}"
+                    current_block_hay = f"{current_block_name} label block instruction group".lower()
+                    block_id = f"inst_block:{inst.index}"
+                    current_block_parent = self.tree.insert(
+                        instr_parent,
+                        "end",
+                        iid=block_id,
+                        text=current_block_name,
+                        values=("Label" if labels_here else "Block", f"starts at instruction {inst.index}"),
+                        open=True,
+                    )
+                    self.item_ranges[block_id] = (inst.offset, 4)
+
+                hay = " ".join([inst.disasm, str(ann_disasm), labels_here, current_block_hay, inst.mnemonic, inst.fmt, f"0x{inst.word:08X}"]).lower()
                 if needle and needle not in hay:
                     continue
+
                 item_id = f"inst:{inst.index}"
-                self.tree.insert(instr_parent, "end", iid=item_id, text=f"{inst.index:04d}: {inst.mnemonic}", values=(inst.fmt, inst.disasm))
+                self.tree.insert(
+                    current_block_parent,
+                    "end",
+                    iid=item_id,
+                    text=f"{inst.index:04d}: {inst.mnemonic}",
+                    values=(inst.fmt, str(ann_disasm)),
+                )
                 self.item_ranges[item_id] = (inst.offset, 4)
 
             opdesc_parent = self.tree.insert(dvlp_item, "end", iid="dvlp_opdescs", text="Operand Descriptors", values=("Table", f"{d.opdesc_count} x 8 bytes"), open=True)
@@ -1751,14 +2122,47 @@ class App(tk.Tk):
                 self.tree.insert(const_parent, "end", iid=item_id, text=c.display_name, values=(c.type_name, f"{c.register_name}  {preview}"))
                 self.item_ranges[item_id] = (c.offset, 0x14)
 
-            self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:inputs", text="Input Register Table", values=("Table", f"{len(dvle.inputs)} entries"))
+            inputs_parent = self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:inputs", text="Input Register Table", values=("Table", f"{len(dvle.inputs)} entries"), open=True)
             self.item_ranges[f"dvle:{dvle.index}:inputs"] = (dvle.offset + dvle.input_offset, dvle.input_count * 8)
-            self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:outputs", text="Output Register Table", values=("Table", f"{len(dvle.outputs)} entries"))
+            for inp in dvle.inputs:
+                hay = f"{inp.name} 0x{inp.start:02x} 0x{inp.end:02x} input register table".lower()
+                if needle and needle not in hay:
+                    continue
+                item_id = f"input:{dvle.index}:{inp.index}"
+                self.tree.insert(inputs_parent, "end", iid=item_id, text=inp.name or f"input_{inp.index}", values=("Input", f"regs 0x{inp.start:02X}..0x{inp.end:02X}"))
+                self.item_ranges[item_id] = (inp.offset, 8)
+
+            outputs_parent = self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:outputs", text="Output Register Table", values=("Table", f"{len(dvle.outputs)} entries"), open=True)
             self.item_ranges[f"dvle:{dvle.index}:outputs"] = (dvle.offset + dvle.output_offset, dvle.output_count * 8)
-            self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:labels", text="Label Table", values=("Table", f"{len(dvle.labels)} entries"))
+            for out in dvle.outputs:
+                type_name = OUTPUT_TYPES.get(out.output_type, f"unknown_{out.output_type}")
+                hay = f"{type_name} o{out.register_id} {component_mask(out.mask)} output register table".lower()
+                if needle and needle not in hay:
+                    continue
+                item_id = f"output:{dvle.index}:{out.index}"
+                self.tree.insert(outputs_parent, "end", iid=item_id, text=type_name, values=("Output", f"o{out.register_id} mask={component_mask(out.mask)}"))
+                self.item_ranges[item_id] = (out.offset, 8)
+
+            labels_parent = self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:labels", text="Label Table", values=("Table", f"{len(dvle.labels)} entries"), open=True)
             self.item_ranges[f"dvle:{dvle.index}:labels"] = (dvle.offset + dvle.label_offset, dvle.label_count * 0x10)
-            self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:symbols", text="Symbol Table", values=("Symbols", f"{len(dvle.symbols)} strings"))
+            for lab in dvle.labels:
+                label_name = self.parser._label_display_name(lab)
+                hay = f"{label_name} {lab.label_id} {lab.opcode_address} label table".lower()
+                if needle and needle not in hay:
+                    continue
+                item_id = f"label:{dvle.index}:{lab.index}"
+                self.tree.insert(labels_parent, "end", iid=item_id, text=label_name, values=("Label", f"id={lab.label_id} target={lab.opcode_address}"))
+                self.item_ranges[item_id] = (lab.offset, 0x10)
+
+            symbols_parent = self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:symbols", text="Symbol Table", values=("Symbols", f"{len(dvle.symbols)} strings"), open=True)
             self.item_ranges[f"dvle:{dvle.index}:symbols"] = (dvle.offset + dvle.symbol_offset, dvle.symbol_size)
+            for sym_i, (rel, text) in enumerate(dvle.symbols):
+                hay = f"{text} 0x{rel:04x} symbol table".lower()
+                if needle and needle not in hay:
+                    continue
+                item_id = f"symbol:{dvle.index}:{sym_i}"
+                self.tree.insert(symbols_parent, "end", iid=item_id, text=text or f"symbol_{sym_i}", values=("Symbol", f"rel=0x{rel:04X}"))
+                self.item_ranges[item_id] = (dvle.offset + dvle.symbol_offset + rel, max(1, len(text) + 1))
 
         if needle:
             self._set_status(f"Filter active: {needle!r}")
@@ -1832,6 +2236,18 @@ class App(tk.Tk):
         self._clear_edit_tab()
 
     def _details_for_item(self, item: str) -> str:
+        if item.startswith("input:"):
+            _, dvle_s, inp_s = item.split(":")
+            return self._single_input_details(self.parser.dvles[int(dvle_s)], int(inp_s))
+        if item.startswith("output:"):
+            _, dvle_s, out_s = item.split(":")
+            return self._single_output_details(self.parser.dvles[int(dvle_s)], int(out_s))
+        if item.startswith("label:"):
+            _, dvle_s, lab_s = item.split(":")
+            return self._single_label_details(self.parser.dvles[int(dvle_s)], int(lab_s))
+        if item.startswith("symbol:"):
+            _, dvle_s, sym_s = item.split(":")
+            return self._single_symbol_details(self.parser.dvles[int(dvle_s)], int(sym_s))
         if item == "dvlb":
             return "\n".join([
                 "DVLB Header",
@@ -1962,7 +2378,162 @@ class App(tk.Tk):
             lines.append("<empty>")
         return "\n".join(lines)
 
+    def _single_input_details(self, dvle: DVLEInfo, inp_idx: int) -> str:
+        inp = dvle.inputs[inp_idx]
+        used_by = []
+        if self.parser.dvlp:
+            for inst in self.parser.dvlp.instructions:
+                for ann in inst.fields.get("register_annotations", []):
+                    if ann.get("dvle") == dvle.index and ann.get("input_index") == inp.index:
+                        used_by.append(f"  {inst.index:04d}: {inst.fields.get('annotated_disasm', inst.disasm)}")
+                        break
+        lines = [
+            f"Input Register: {inp.name or f'input_{inp.index}'}",
+            f"DVLE: {dvle.index}",
+            f"Index: {inp.index}",
+            f"Entry offset: 0x{inp.offset:X}",
+            f"Name symbol offset: 0x{inp.name_offset:X}",
+            f"Register range: 0x{inp.start:02X}..0x{inp.end:02X}",
+            "",
+            "Decoded instructions using this input/register range:",
+        ]
+        lines.extend(used_by or ["  <none detected>"])
+        return "\n".join(lines)
+
+    def _single_output_details(self, dvle: DVLEInfo, out_idx: int) -> str:
+        out = dvle.outputs[out_idx]
+        type_name = OUTPUT_TYPES.get(out.output_type, f"unknown_{out.output_type}")
+        used_by = []
+        if self.parser.dvlp:
+            for inst in self.parser.dvlp.instructions:
+                for ann in inst.fields.get("register_annotations", []):
+                    if ann.get("dvle") == dvle.index and ann.get("kind") == "output" and ann.get("table_index") == out.index:
+                        used_by.append(f"  {inst.index:04d}: {inst.fields.get('annotated_disasm', inst.disasm)}")
+                        break
+        lines = [
+            f"Output Register: {type_name}",
+            f"DVLE: {dvle.index}",
+            f"Index: {out.index}",
+            f"Entry offset: 0x{out.offset:X}",
+            f"Register: o{out.register_id}",
+            f"Mask: {component_mask(out.mask)}",
+            f"Unknown: 0x{out.unknown:04X}",
+            "",
+            "Decoded instructions writing this output:",
+        ]
+        lines.extend(used_by or ["  <none detected>"])
+        return "\n".join(lines)
+
+    def _single_label_details(self, dvle: DVLEInfo, lab_idx: int) -> str:
+        lab = dvle.labels[lab_idx]
+        label_name = self.parser._label_display_name(lab)
+        target_inst = None
+        refs = []
+        if self.parser.dvlp:
+            if 0 <= lab.opcode_address < len(self.parser.dvlp.instructions):
+                target_inst = self.parser.dvlp.instructions[lab.opcode_address]
+            for inst in self.parser.dvlp.instructions:
+                for target in inst.fields.get("target_annotations", []):
+                    if target.get("dvle") == dvle.index and target.get("label_index") == lab.index:
+                        refs.append(f"  {inst.index:04d}: {inst.fields.get('annotated_disasm', inst.disasm)}")
+                        break
+        lines = [
+            f"Label: {label_name}",
+            f"DVLE: {dvle.index}",
+            f"Index: {lab.index}",
+            f"Entry offset: 0x{lab.offset:X}",
+            f"Label ID: {lab.label_id}",
+            f"Opcode address: {lab.opcode_address}",
+            f"Name symbol offset: 0x{lab.name_offset:X}",
+            f"Unknown A: {lab.unknown_a.hex(' ').upper()}",
+            f"Unknown B: 0x{lab.unknown_b:08X}",
+            "",
+            "Target instruction:",
+            f"  {target_inst.index:04d}: {target_inst.fields.get('annotated_disasm', target_inst.disasm)}" if target_inst else "  <outside decoded opcode table>",
+            "",
+            "Instructions referencing this label:",
+        ]
+        lines.extend(refs or ["  <none detected>"])
+        return "\n".join(lines)
+
+    def _single_symbol_details(self, dvle: DVLEInfo, sym_idx: int) -> str:
+        rel, text = dvle.symbols[sym_idx]
+        refs = []
+        for inp in dvle.inputs:
+            if inp.name_offset == rel:
+                refs.append(f"Input[{inp.index}] regs 0x{inp.start:02X}..0x{inp.end:02X}")
+        for lab in dvle.labels:
+            if lab.name_offset == rel:
+                refs.append(f"Label[{lab.index}] id={lab.label_id} opcode={lab.opcode_address}")
+        for c in dvle.constants:
+            if c.mapped_input == text or c.name == text or c.name.startswith(text + "["):
+                refs.append(f"Constant[{c.index}] {c.register_name} {c.type_name}")
+        lines = [
+            f"Symbol: {text}",
+            f"DVLE: {dvle.index}",
+            f"Index: {sym_idx}",
+            f"Relative offset: 0x{rel:X}",
+            f"Absolute offset: 0x{dvle.offset + dvle.symbol_offset + rel:X}",
+            "",
+            "Referenced by:",
+        ]
+        lines.extend(["  " + r for r in refs] or ["  <no parsed reference>"])
+        return "\n".join(lines)
+
     def _raw_table_for_item(self, item: str) -> str:
+        if item.startswith("input:"):
+            _, dvle_s, inp_s = item.split(":")
+            dvle = self.parser.dvles[int(dvle_s)]
+            inp = dvle.inputs[int(inp_s)]
+            return json.dumps({
+                "dvle": dvle.index,
+                "input": inp.index,
+                "name": inp.name,
+                "offset": f"0x{inp.offset:X}",
+                "name_offset": f"0x{inp.name_offset:X}",
+                "start": f"0x{inp.start:02X}",
+                "end": f"0x{inp.end:02X}",
+            }, indent=2)
+        if item.startswith("output:"):
+            _, dvle_s, out_s = item.split(":")
+            dvle = self.parser.dvles[int(dvle_s)]
+            out = dvle.outputs[int(out_s)]
+            return json.dumps({
+                "dvle": dvle.index,
+                "output": out.index,
+                "type": OUTPUT_TYPES.get(out.output_type, f"unknown_{out.output_type}"),
+                "type_raw": out.output_type,
+                "register": f"o{out.register_id}",
+                "mask": component_mask(out.mask),
+                "unknown": f"0x{out.unknown:04X}",
+                "offset": f"0x{out.offset:X}",
+            }, indent=2)
+        if item.startswith("label:"):
+            _, dvle_s, lab_s = item.split(":")
+            dvle = self.parser.dvles[int(dvle_s)]
+            lab = dvle.labels[int(lab_s)]
+            return json.dumps({
+                "dvle": dvle.index,
+                "label": lab.index,
+                "name": self.parser._label_display_name(lab),
+                "id": lab.label_id,
+                "opcode_address": lab.opcode_address,
+                "name_offset": f"0x{lab.name_offset:X}",
+                "unknown_a": lab.unknown_a.hex(" ").upper(),
+                "unknown_b": f"0x{lab.unknown_b:08X}",
+                "offset": f"0x{lab.offset:X}",
+            }, indent=2)
+        if item.startswith("symbol:"):
+            _, dvle_s, sym_s = item.split(":")
+            dvle = self.parser.dvles[int(dvle_s)]
+            rel, text = dvle.symbols[int(sym_s)]
+            return json.dumps({
+                "dvle": dvle.index,
+                "symbol": int(sym_s),
+                "text": text,
+                "relative_offset": f"0x{rel:X}",
+                "absolute_offset": f"0x{dvle.offset + dvle.symbol_offset + rel:X}",
+            }, indent=2)
         if item.startswith("const:"):
             _, dvle_s, const_s = item.split(":")
             c = self.parser.dvles[int(dvle_s)].constants[int(const_s)]
@@ -2038,6 +2609,7 @@ class App(tk.Tk):
             return
         inst = self.parser.dvlp.instructions[inst_idx]
         f = inst.fields
+        annotated = f.get("annotated_disasm", inst.disasm)
         details = [
             f"Instruction {inst.index}",
             f"Offset: 0x{inst.offset:X}",
@@ -2046,10 +2618,47 @@ class App(tk.Tk):
             f"Effective opcode: 0x{inst.opcode:02X}; raw top opcode bits: 0x{inst.raw_opcode:02X}",
             f"Format: {inst.fmt}",
             f"Disasm: {inst.disasm}",
-            "",
-            "Decoded fields:",
+            f"Annotated disasm: {annotated}",
         ]
-        for key in sorted(k for k in f.keys() if k not in {"opdesc"}):
+
+        source_line = f.get("source_line")
+        if source_line:
+            details.append(f"Source line: {source_line.get('filename', '')}:{source_line.get('line', '')}")
+
+        if f.get("labels_here"):
+            details.append("")
+            details.append("Labels at this instruction:")
+            for lab in f.get("labels_here", []):
+                details.append(f"  DVLE {lab.get('dvle')}: {lab.get('name')} (id={lab.get('label_id')})")
+
+        if f.get("entrypoints") or f.get("end_markers") or f.get("active_dvles"):
+            details.append("")
+            details.append("DVLE ranges:")
+            for ref in f.get("entrypoints", []):
+                details.append(f"  Entry for DVLE {ref.get('dvle')} ({ref.get('shader_type')})")
+            for ref in f.get("end_markers", []):
+                details.append(f"  End marker for DVLE {ref.get('dvle')} ({ref.get('shader_type')})")
+            active = ", ".join(f"DVLE {x.get('dvle')}" for x in f.get("active_dvles", []))
+            if active:
+                details.append(f"  In active range: {active}")
+
+        if f.get("register_annotations"):
+            details.append("")
+            details.append("Register/symbol mapping:")
+            for ann in f.get("register_annotations", []):
+                sym = ann.get("symbol") or "-"
+                table = ann.get("table") or "-"
+                details.append(f"  DVLE {ann.get('dvle')} {ann.get('role')}: {ann.get('register')} -> {sym} ({table})")
+
+        if f.get("target_annotations"):
+            details.append("")
+            details.append("Branch/call target labels:")
+            for ann in f.get("target_annotations", []):
+                details.append(f"  DVLE {ann.get('dvle')}: target {ann.get('opcode_address')} -> {ann.get('name')}")
+
+        details.extend(["", "Decoded fields:"])
+        hidden = {"opdesc", "source_line", "labels_here", "entrypoints", "end_markers", "active_dvles", "register_annotations", "target_annotations", "annotated_disasm", "annotated_disasm_by_dvle"}
+        for key in sorted(k for k in f.keys() if k not in hidden):
             details.append(f"  {key}: {f[key]}")
         if "opdesc" in f:
             details.append("")
@@ -2060,7 +2669,7 @@ class App(tk.Tk):
         self._set_text(self.hex_text, hexdump(self.parser.data, inst.offset, 0x40))
         self._set_text(self.raw_text, self._raw_table_for_item(f"inst:{inst_idx}"))
 
-        self.instr_header_label.configure(text=f"Instruction {inst.index}: {inst.disasm}")
+        self.instr_header_label.configure(text=f"Instruction {inst.index}: {f.get('annotated_disasm', inst.disasm)}")
         self.instr_raw_var.set(f"0x{inst.word:08X}")
         self.instr_mnemonic_var.set(inst.mnemonic)
         self.instr_asm_var.set(inst.disasm)
