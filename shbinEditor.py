@@ -3,13 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import shutil
 import struct
 import math
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 APP_TITLE = "Cracko298's 3DS SHBIN Shader Editor - DVLB/DVLP/DVLE"
@@ -78,6 +79,61 @@ ADDR_REG_NAMES = {0: "", 1: "a0.x", 2: "a0.y", 3: "aL"}
 CMP_OP_NAMES = {0: "EQ", 1: "NE", 2: "LT", 3: "LE", 4: "GT", 5: "GE", 6: "ALWAYS6", 7: "ALWAYS7"}
 CONDOP_NAMES = {0: "OR", 1: "AND", 2: "X", 3: "Y"}
 
+REGISTER_NAME_RE = re.compile(r"^[vorcib]\d+$", re.IGNORECASE)
+REGISTER_DISPLAY_RE = re.compile(r"\(([vorcib]\d+)\)\s*$", re.IGNORECASE)
+REGISTER_DISPLAY_ANYWHERE_RE = re.compile(r"\(([vorcib]\d+)\)", re.IGNORECASE)
+REGISTER_ANGLE_RE = re.compile(r"<([vorcib]\d+)>", re.IGNORECASE)
+
+
+VECTOR_COMPONENT_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<components>[xyzw]{1,4})$", re.IGNORECASE)
+
+
+def split_vector_component_suffix(text: str) -> Tuple[str, str]:
+    s = str(text or "").strip()
+    m = VECTOR_COMPONENT_SUFFIX_RE.match(s)
+    if not m:
+        return s, ""
+    return m.group("base"), m.group("components").lower()
+
+
+def append_register_selector_for_display(base: str, selector: str) -> str:
+    b = str(base or "").strip()
+    sel = str(selector or "").strip().lower()
+    if not b or not sel or sel in {"-", "xyzw"}:
+        return b
+    # Native registers do not contain a symbol suffix, so keep normal behavior ^_^
+    if REGISTER_NAME_RE.match(b):
+        return f"{b}.{sel}"
+    stem, existing_components = split_vector_component_suffix(b)
+    if existing_components:
+        b = stem
+    return f"{b}.{sel}"
+
+
+def strip_register_display_token(text: str) -> str:
+    s = str(text).strip()
+    if not s:
+        return s
+    m = REGISTER_DISPLAY_RE.search(s)
+    if m:
+        return m.group(1).lower()
+    m = REGISTER_ANGLE_RE.search(s)
+    if m:
+        return m.group(1).lower()
+
+    m = REGISTER_DISPLAY_ANYWHERE_RE.search(s)
+    if m:
+        suffix = s[m.end():].strip()
+        return (m.group(1).lower() + suffix).strip()
+    # Also accept forms like 'c17 = CHUNK_ORIGIN' or 'c17 | CHUNK_ORIGIN'.
+    head = re.split(r"\s*(?:=|\||:|-)\s*", s, maxsplit=1)[0].strip()
+    if REGISTER_NAME_RE.match(head):
+        return head.lower()
+    return s
+
+def native_register_from_display(text: str) -> str:
+    return strip_register_display_token(text).strip().lower()
+
 def get_bits(value: int, shift: int, count: int) -> int:
     return (int(value) >> shift) & ((1 << count) - 1)
 
@@ -134,7 +190,7 @@ def pica_src_reg_name(raw: int) -> str:
     return f"c{raw - 0x20}"
 
 def parse_pica_dest_reg(text: str) -> int:
-    s = str(text).strip().lower()
+    s = native_register_from_display(text)
     if not s:
         return 0
     if s.startswith("0x") or s.isdigit():
@@ -147,7 +203,7 @@ def parse_pica_dest_reg(text: str) -> int:
     raise ValueError(f"Destination register must be oN/rN or a raw number, got {text!r}")
 
 def parse_pica_src_reg(text: str) -> int:
-    s = str(text).strip().lower()
+    s = native_register_from_display(text)
     if not s:
         return 0
     if s.startswith("0x") or s.isdigit():
@@ -160,6 +216,12 @@ def parse_pica_src_reg(text: str) -> int:
     if prefix == "c":
         return (0x20 + number) & 0x7F
     raise ValueError(f"Source register must be vN/rN/cN or a raw number, got {text!r}")
+
+def parse_pica_src_reg5(text: str) -> int:
+    raw = parse_pica_src_reg(text)
+    if raw >= 0x20:
+        raise ValueError(f"This source slot is 5-bit and only supports vN/rN, not constants: {text!r}")
+    return raw & 0x1F
 
 def pica_dest_mask_to_string(mask: int) -> str:
     letters = "xyzw"
@@ -404,16 +466,16 @@ def pica_build_instruction_word(mnemonic: str, *, base_word: int = 0, desc_id: i
         word = set_bits(word, 21, 5, parse_pica_dest_reg(dst))
         if fmt == "1i":
             word = set_bits(word, 7, 7, parse_pica_src_reg(src2))
-            word = set_bits(word, 14, 5, parse_pica_src_reg(src1))
+            word = set_bits(word, 14, 5, parse_pica_src_reg5(src1))
         else:
-            word = set_bits(word, 7, 5, parse_pica_src_reg(src2))
+            word = set_bits(word, 7, 5, parse_pica_src_reg5(src2))
             word = set_bits(word, 12, 7, parse_pica_src_reg(src1))
         return word & 0xFFFFFFFF
 
     if fmt == "1c":
         word = set_bits(word, 27, 5, 0x17)  # CMP's actual opcode field. bit 26 belongs to cmpx.
         word = set_bits(word, 0, 7, int(desc_id))
-        word = set_bits(word, 7, 5, parse_pica_src_reg(src2))
+        word = set_bits(word, 7, 5, parse_pica_src_reg5(src2))
         word = set_bits(word, 12, 7, parse_pica_src_reg(src1))
         word = set_bits(word, 19, 2, int(idx))
         word = set_bits(word, 21, 3, int(cmpy))
@@ -450,14 +512,14 @@ def pica_build_instruction_word(mnemonic: str, *, base_word: int = 0, desc_id: i
     if fmt in {"5", "5i"}:
         word = set_bits(word, 29, 3, 0x6 if fmt == "5i" else 0x7)
         word = set_bits(word, 0, 5, int(desc_id))
-        word = set_bits(word, 17, 5, parse_pica_src_reg(src1))
+        word = set_bits(word, 17, 5, parse_pica_src_reg5(src1))
         word = set_bits(word, 22, 2, int(idx))
         word = set_bits(word, 24, 5, parse_pica_dest_reg(dst))
         if fmt == "5i":
             word = set_bits(word, 5, 7, parse_pica_src_reg(src3))
-            word = set_bits(word, 12, 5, parse_pica_src_reg(src2))
+            word = set_bits(word, 12, 5, parse_pica_src_reg5(src2))
         else:
-            word = set_bits(word, 5, 5, parse_pica_src_reg(src3))
+            word = set_bits(word, 5, 5, parse_pica_src_reg5(src3))
             word = set_bits(word, 10, 7, parse_pica_src_reg(src2))
         return word & 0xFFFFFFFF
 
@@ -513,8 +575,224 @@ def parse_arithmetic_asm_line(line: str) -> Tuple[str, Dict[str, Any], Dict[str,
         raise ValueError("Simple ASM parser supports arithmetic instructions only. Use field/raw editing for flow-control.")
     return mnemonic, instr, opdesc
 
+
+
+DEFAULT_REGISTER_SYMBOLS = {
+    # Keep empty, honestly this is just from tests and I dont wanna break anything tbf-
+}
+
+ASM_CONTROL_COMMENT = "; Full ASM import supports normal instruction lines, labels, .word 0x..., and the existing indexed export format."
+
+def clean_asm_line(line: str) -> str:
+    return str(line).split(";", 1)[0].split("#", 1)[0].strip()
+
+def strip_asm_index_prefix(line: str) -> Tuple[Optional[int], str]:
+    cleaned = clean_asm_line(line)
+    if not cleaned:
+        return None, ""
+    head, sep, rest = cleaned.partition(":")
+    h = head.strip()
+    if sep and (h.isdigit() or (h.lower().startswith("0x") and len(h) > 2)):
+        return int(h, 0), rest.strip()
+    return None, cleaned
+
+def split_asm_args(text: str) -> List[str]:
+    return [a.strip() for a in str(text).split(",") if a.strip()]
+
+def parse_condop(text: str) -> int:
+    s = str(text).strip().upper()
+    for k, v in CONDOP_NAMES.items():
+        if s == v.upper():
+            return k
+    return int(s, 0)
+
+def parse_cmpop(text: str) -> int:
+    s = str(text).strip().upper()
+    for k, v in CMP_OP_NAMES.items():
+        if s == v.upper():
+            return k
+    return int(s, 0)
+
+def parse_target_token(text: str, labels: Optional[Dict[str, int]] = None) -> int:
+    token = str(text).strip()
+    if "<" in token and ">" in token:
+        token = token.split("<", 1)[0].strip()
+    if labels and token in labels:
+        return int(labels[token])
+    if labels and token.lower() in {k.lower(): v for k, v in labels.items()}:
+        lowered = {k.lower(): v for k, v in labels.items()}
+        return int(lowered[token.lower()])
+    return int(token, 0)
+
+def parse_uniform_token(text: str) -> int:
+    s = native_register_from_display(text)
+    if s.startswith(("b", "i")) and len(s) > 1:
+        return int(s[1:], 0)
+    return int(s, 0)
+
+def normalize_asm_register_aliases(line: str, symbol_to_register: Optional[Dict[str, str]] = None) -> str:
+    out = str(line)
+
+    # keeps the suffixes such as swizzles/masks intact: 'Name (c17).xy' -> 'c17.xy' :/ I forgot todo this, and it'd break shaders...
+    out = re.sub(
+        r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_.$\[\]]*)\s*\(([vorcib]\d+)\)",
+        lambda m: m.group(2).lower(),
+        out,
+        flags=re.IGNORECASE,
+    )
+
+    if not symbol_to_register:
+        return out
+
+    def symbol_variants(symbol: str) -> List[str]:
+        variants: List[str] = []
+        s = str(symbol or "").strip()
+        if not s:
+            return variants
+        variants.append(s)
+        us = s.replace(" ", "_")
+        if us != s:
+            variants.append(us)
+
+        # Real DVLE input names 'can' already include display components, but idk. QoL just in case 
+        # e.g. bTexCoord.xy. Also allow the base symbol so bTexCoord.xyzz can become vN.xyzz instead of bTexCoord.xy.xyzz. 
+        stem, component_suffix = split_vector_component_suffix(s)
+        if component_suffix and stem and stem != s:
+            variants.append(stem)
+            stem_us = stem.replace(" ", "_")
+            if stem_us != stem:
+                variants.append(stem_us)
+        return variants
+
+    replacements: List[Tuple[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+    for symbol, reg in symbol_to_register.items():
+        rg = native_register_from_display(reg)
+        if not rg:
+            continue
+        for sym in symbol_variants(str(symbol)):
+            key = (sym.lower(), rg.lower())
+            if key not in seen:
+                replacements.append((sym, rg))
+                seen.add(key)
+
+    # Replace longest names first so CHUNK_ORIGIN does not partly replace
+    # CHUNK_ORIGIN_AND_SCALE. A dot after the symbol is allowed because it could maybe the instruction mask/swizzle?
+    for symbol, reg in sorted(replacements, key=lambda kv: len(kv[0]), reverse=True):
+        pattern = re.compile(r"(?<![A-Za-z0-9_.$])" + re.escape(symbol) + r"(?![A-Za-z0-9_\[])", re.IGNORECASE)
+        out = pattern.sub(reg, out)
+    return out
+
+def parse_general_asm_line(line: str, *, base_word: int = 0, default_desc_id: int = 0,
+                           labels: Optional[Dict[str, int]] = None,
+                           symbol_to_register: Optional[Dict[str, str]] = None) -> Tuple[int, Optional[Dict[str, Any]]]:
+
+    explicit_index, body = strip_asm_index_prefix(line)
+    del explicit_index
+    body = normalize_asm_register_aliases(body, symbol_to_register)
+    if not body:
+        raise ValueError("Empty assembly line")
+    if body.endswith(":"):
+        raise ValueError("Label-only line")
+    if body.lower().startswith((".word", "word", "raw")):
+        parts = body.replace("=", " ").split()
+        if len(parts) < 2:
+            raise ValueError("Raw word line needs a value")
+        return int(parts[1], 0) & 0xFFFFFFFF, None
+
+    parts = body.replace("\t", " ").split(None, 1)
+    mnemonic = parts[0].upper()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if mnemonic not in MNEMONIC_TO_OPCODE:
+        raise ValueError(f"Unsupported mnemonic {mnemonic!r}")
+    op = MNEMONIC_TO_OPCODE[mnemonic]
+    fmt = pica_instruction_format(op, is_word=False)
+
+    if fmt in {"1", "1u", "1i", "5", "5i"}:
+        mnem, instr, opdesc = parse_arithmetic_asm_line(body)
+        instr["desc_id"] = default_desc_id
+        word = pica_build_instruction_word(
+            mnem,
+            base_word=base_word,
+            desc_id=int(instr.get("desc_id", default_desc_id)),
+            dst=instr.get("dst", "r0"),
+            src1=instr.get("src1", "v0"),
+            src2=instr.get("src2", "v0"),
+            src3=instr.get("src3", "v0"),
+            idx=int(instr.get("idx", 0)),
+        )
+        return word, opdesc
+
+    args = split_asm_args(rest)
+    if fmt == "1c":
+        # cmp eq, lt, v0, c0
+        if len(args) != 4:
+            raise ValueError("cmp expects: cmp cmpx, cmpy, src1, src2")
+        opdesc = {"mask": "xyzw", "src1_swizzle": "xyzw", "src2_swizzle": "xyzw", "src3_swizzle": "xyzw", "src1_neg": False, "src2_neg": False, "src3_neg": False}
+        def split_src(arg: str) -> Tuple[str, bool, str]:
+            arg = arg.strip()
+            neg = arg.startswith("-")
+            if neg:
+                arg = arg[1:].strip()
+            reg, dot, swz = arg.partition(".")
+            return reg.strip(), neg, (swz.strip() if dot else "xyzw")
+        s1, n1, sw1 = split_src(args[2]); s2, n2, sw2 = split_src(args[3])
+        opdesc.update({"src1_swizzle": sw1, "src2_swizzle": sw2, "src1_neg": n1, "src2_neg": n2})
+        return pica_build_instruction_word(mnemonic, base_word=base_word, desc_id=default_desc_id,
+                                           src1=s1, src2=s2, cmpx=parse_cmpop(args[0]), cmpy=parse_cmpop(args[1])), opdesc
+
+    if fmt == "0":
+        return pica_build_instruction_word(mnemonic, base_word=base_word), None
+
+    if fmt == "2":
+        target = 0
+        num = 0
+        condop = 0
+        refx = 0
+        refy = 0
+        if op == 0x23:  # BREAKC has no target in its displayed form.
+            if args:
+                condop = parse_condop(args[0].split()[0])
+            joined = " ".join(args).replace(",", " ").lower()
+        else:
+            if len(args) >= 1:
+                target = parse_target_token(args[0], labels)
+            if len(args) >= 2:
+                num = int(args[1], 0)
+            if len(args) >= 3:
+                condop = parse_condop(args[2].split()[0])
+            joined = " ".join(args[2:]).replace(",", " ").lower()
+        for tok in joined.split():
+            if tok.startswith("x="):
+                refx = int(tok.split("=", 1)[1], 0)
+            elif tok.startswith("y="):
+                refy = int(tok.split("=", 1)[1], 0)
+        return pica_build_instruction_word(mnemonic, base_word=base_word, target=target, num=num, condop=condop, refx=refx, refy=refy), None
+
+    if fmt == "3":
+        # ifu target, num, b0 | loop target, num, i0
+        if len(args) < 3:
+            raise ValueError(f"{mnemonic.lower()} expects: target, num, bN/iN")
+        return pica_build_instruction_word(mnemonic, base_word=base_word,
+                                           target=parse_target_token(args[0], labels),
+                                           num=int(args[1], 0),
+                                           uniform_id=parse_uniform_token(args[2])), None
+
+    if fmt == "4":
+        vals = {"vtx": 0, "vertex": 0, "prim": 0, "winding": 0}
+        for chunk in rest.replace(",", " ").split():
+            if "=" in chunk:
+                k, v = chunk.split("=", 1)
+                vals[k.strip().lower()] = int(v, 0)
+        return pica_build_instruction_word(mnemonic, base_word=base_word,
+                                           vertex_id=vals.get("vtx", vals.get("vertex", 0)),
+                                           prim_emit=vals.get("prim", 0),
+                                           winding=vals.get("winding", 0)), None
+
+    raise ValueError(f"Unsupported instruction format {fmt!r} for {mnemonic}")
+
 def float_to_pica24(value: float) -> int:
-    """Convert Python float32-ish value to the 3DS/PICA 24-bit float storage form."""
+    # Converts Python Float32 values to  PICA200 24-bit Floats. I hated this math ngl...
     if value == 0:
         return 0
     try:
@@ -774,6 +1052,7 @@ class SHBINParser:
         self.dvles: List[DVLEInfo] = []
         self.issues: List[ParseIssue] = []
         self._reader: Optional[BinaryReader] = None
+        self.register_symbol_maps: Dict[str, Dict[str, str]] = {"global": dict(DEFAULT_REGISTER_SYMBOLS)}
 
     @property
     def loaded(self) -> bool:
@@ -1148,34 +1427,37 @@ class SHBINParser:
 
     def _dest_symbol_info(self, dvle: DVLEInfo, dst_raw: int) -> Dict[str, Any]:
         reg_name = pica_dest_reg_name(dst_raw)
+        alias = self.register_alias(reg_name, dvle.index)
         if dst_raw < 0x10:
             out = self._output_for_register(dvle, dst_raw)
             if out:
-                symbol = OUTPUT_TYPES.get(out.output_type, f"output_{out.output_type}")
+                symbol = alias or OUTPUT_TYPES.get(out.output_type, f"output_{out.output_type}")
                 return {
                     "register": reg_name,
                     "symbol": symbol,
                     "kind": "output",
-                    "table": "Output Register Table",
+                    "table": "User Symbol Map" if alias else "Output Register Table",
                     "table_index": out.index,
                     "mask": component_mask(out.mask),
                 }
-        return {"register": reg_name, "symbol": "", "kind": "temporary" if dst_raw >= 0x10 else "output", "table": "", "table_index": None}
+        return {"register": reg_name, "symbol": alias, "kind": "temporary" if dst_raw >= 0x10 else "output", "table": "User Symbol Map" if alias else "", "table_index": None}
 
     def _src_symbol_info(self, dvle: DVLEInfo, src_raw: int) -> Dict[str, Any]:
         reg_name = pica_src_reg_name(src_raw)
         if src_raw < 0x10:
+            alias = self.register_alias(reg_name, dvle.index)
             symbol, inp = self._input_symbol_for_register(dvle, src_raw)
             return {
                 "register": reg_name,
-                "symbol": symbol,
+                "symbol": alias or symbol,
                 "kind": "attribute/input",
-                "table": "Input Register Table" if inp else "",
+                "table": "User Symbol Map" if alias else ("Input Register Table" if inp else ""),
                 "table_index": inp.index if inp else None,
                 "register_number": src_raw,
             }
         if src_raw < 0x20:
-            return {"register": reg_name, "symbol": "", "kind": "temporary", "table": "", "table_index": None, "register_number": src_raw}
+            alias = self.register_alias(reg_name, dvle.index)
+            return {"register": reg_name, "symbol": alias, "kind": "temporary", "table": "User Symbol Map" if alias else "", "table_index": None, "register_number": src_raw}
 
         const_id = src_raw - 0x20
         register_number = FLOAT_REG_BASE + const_id
@@ -1184,7 +1466,11 @@ class SHBINParser:
         symbol = ""
         table = ""
         table_index: Optional[int] = None
-        if c and c.display_name != c.register_name:
+        alias = self.register_alias(reg_name, dvle.index)
+        if alias:
+            symbol = alias
+            table = "User Symbol Map"
+        elif c and c.display_name != c.register_name:
             symbol = c.display_name
             table = "Constant Table"
             table_index = c.index
@@ -1217,7 +1503,11 @@ class SHBINParser:
         symbol = ""
         table = ""
         table_index: Optional[int] = None
-        if c and c.display_name != c.register_name:
+        alias = self.register_alias(reg_name, dvle.index)
+        if alias:
+            symbol = alias
+            table = "User Symbol Map"
+        elif c and c.display_name != c.register_name:
             symbol = c.display_name
             table = "Constant Table"
             table_index = c.index
@@ -1259,18 +1549,15 @@ class SHBINParser:
             raw = int(f.get("dst_raw", 0))
             base = record("dst", self._dest_symbol_info(dvle, raw))
             mask = str(desc.get("dest_mask", "xyzw"))
-            if mask not in {"-", "xyzw", ""}:
-                base += "." + mask
-            return base
+            return append_register_selector_for_display(base, mask)
 
         def src_text(role: str, raw_key: str, neg_key: str, swizzle_key: str) -> str:
             raw = int(f.get(raw_key, 0))
             info = self._src_symbol_info(dvle, raw)
             base = record(role, info)
-            out = ("-" if bool(desc.get(neg_key, False)) else "") + base
             swizzle = str(desc.get(swizzle_key, "xyzw"))
-            if swizzle and swizzle != "xyzw":
-                out += "." + swizzle
+            base = append_register_selector_for_display(base, swizzle)
+            out = ("-" if bool(desc.get(neg_key, False)) else "") + base
             return out
 
         def uniform_text(entry_type: int, uniform_id: int) -> str:
@@ -1423,6 +1710,489 @@ class SHBINParser:
             raise ValueError("Selected opdesc is outside the file range")
         struct.pack_into("<II", self.data, abs_off, int(desc) & 0xFFFFFFFF, int(flags) & 0xFFFFFFFF)
 
+
+    def _symbol_maps(self) -> Dict[str, Dict[str, str]]:
+        maps = getattr(self, "register_symbol_maps", None)
+        if not isinstance(maps, dict):
+            maps = {"global": dict(DEFAULT_REGISTER_SYMBOLS)}
+            self.register_symbol_maps = maps
+        # Do not re-inject defaults after the user deletes/clears aliases/names. Updated since last :/
+        maps.setdefault("global", {})
+        return maps
+
+    def register_alias(self, register: str, dvle_index: Optional[int] = None) -> str:
+        reg = str(register).strip()
+        maps = self._symbol_maps()
+        key = f"dvle:{dvle_index}" if dvle_index is not None else "global"
+        if key in maps and reg in maps[key]:
+            return maps[key][reg]
+        return maps.get("global", {}).get(reg, "")
+
+    def set_register_alias(self, register: str, symbol: str, dvle_index: Optional[int] = None) -> None:
+        reg = native_register_from_display(register)
+        if not reg:
+            raise ValueError("Register name is required, e.g. c17, v0, o2, r3, b0, i0")
+        # Validate the register syntax enough to avoid typos. This does not create new PICA registers;
+        low = reg.lower()
+        if low[0] in {"v", "r", "c"}:
+            parse_pica_src_reg(low)
+        elif low[0] == "o":
+            parse_pica_dest_reg(low)
+        elif low[0] in {"b", "i"}:
+            int(low[1:] or "0", 0)
+        else:
+            raise ValueError("Register must start with v, r, c, o, b, or i")
+        maps = self._symbol_maps()
+        key = f"dvle:{dvle_index}" if dvle_index is not None else "global"
+        symbol = str(symbol).strip()
+        if symbol:
+            maps.setdefault(key, {})[low] = symbol
+        else:
+            maps.setdefault(key, {}).pop(low, None)
+        self.parse()
+
+    def _alias_for_dest(self, dvle: DVLEInfo, dst_raw: int) -> str:
+        reg = pica_dest_reg_name(dst_raw)
+        return self.register_alias(reg, dvle.index)
+
+    def _alias_for_src(self, dvle: DVLEInfo, src_raw: int) -> str:
+        reg = pica_src_reg_name(src_raw)
+        return self.register_alias(reg, dvle.index)
+
+    def _alias_for_uniform(self, dvle: DVLEInfo, entry_type: int, uniform_id: int) -> str:
+        reg = ("i" if entry_type == 1 else "b") + str(int(uniform_id))
+        return self.register_alias(reg, dvle.index)
+
+    def symbol_to_register_map(self, dvle_index: Optional[int] = None) -> Dict[str, str]:
+        symbol_map: Dict[str, str] = {}
+
+        def add(symbol: str, reg: str) -> None:
+            sym = str(symbol or "").strip()
+            rg = str(reg or "").strip().lower()
+            if not sym or not rg:
+                return
+            symbol_map.setdefault(sym, rg)
+            symbol_map.setdefault(sym.replace(" ", "_"), rg)
+            stem, component_suffix = split_vector_component_suffix(sym)
+            if component_suffix and stem and stem != sym:
+                symbol_map.setdefault(stem, rg)
+                symbol_map.setdefault(stem.replace(" ", "_"), rg)
+
+        dvle: Optional[DVLEInfo] = None
+        if dvle_index is not None and 0 <= int(dvle_index) < len(self.dvles):
+            dvle = self.dvles[int(dvle_index)]
+
+        if dvle is not None:
+            for inp in dvle.inputs:
+                lo, hi = sorted((inp.start, inp.end))
+                for reg_num in range(lo, hi + 1):
+                    if inp.name:
+                        add(inp.name if lo == hi else f"{inp.name}[{reg_num - lo}]", f"v{reg_num}")
+            for shader_out in dvle.outputs:
+                add(OUTPUT_TYPES.get(shader_out.output_type, f"output_{shader_out.output_type}"), f"o{shader_out.register_id}")
+            for c in dvle.constants:
+                if c.display_name and c.display_name != c.register_name:
+                    add(c.display_name, c.register_name)
+
+        maps = self._symbol_maps()
+        for reg, sym in maps.get("global", {}).items():
+            if sym:
+                add(str(sym), str(reg).lower())
+        if dvle_index is not None:
+            for reg, sym in maps.get(f"dvle:{int(dvle_index)}", {}).items():
+                if sym:
+                    add(str(sym), str(reg).lower())
+        return symbol_map
+
+    def register_display_name(self, register: str, dvle_index: Optional[int] = None) -> str:
+        reg = str(register or "").strip().lower()
+        if not reg:
+            return ""
+        alias = self.register_alias(reg, dvle_index)
+        if alias:
+            return f"{alias} ({reg})"
+        if dvle_index is not None and 0 <= int(dvle_index) < len(self.dvles):
+            dvle = self.dvles[int(dvle_index)]
+            try:
+                if reg.startswith("o"):
+                    out = self._output_for_register(dvle, int(reg[1:], 0))
+                    if out:
+                        return f"{OUTPUT_TYPES.get(out.output_type, f'output_{out.output_type}')} ({reg})"
+                if reg.startswith("v"):
+                    symbol, _inp = self._input_symbol_for_register(dvle, int(reg[1:], 0))
+                    if symbol:
+                        return f"{symbol} ({reg})"
+                if reg.startswith("c"):
+                    c = self._constant_for(dvle, 2, int(reg[1:], 0))
+                    if c and c.display_name != c.register_name:
+                        return f"{c.display_name} ({reg})"
+                if reg.startswith("i"):
+                    c = self._constant_for(dvle, 1, int(reg[1:], 0))
+                    if c and c.display_name != c.register_name:
+                        return f"{c.display_name} ({reg})"
+                if reg.startswith("b"):
+                    c = self._constant_for(dvle, 0, int(reg[1:], 0))
+                    if c and c.display_name != c.register_name:
+                        return f"{c.display_name} ({reg})"
+            except Exception:
+                pass
+        return reg
+
+    def register_display_choices(self, dvle_index: Optional[int] = None, kind: str = "src") -> List[str]:
+        kind = str(kind or "src").lower()
+        regs: List[str] = []
+        if kind == "dst":
+            regs.extend(f"o{i}" for i in range(16))
+            regs.extend(f"r{i}" for i in range(16))
+        elif kind == "uniform":
+            regs.extend(f"b{i}" for i in range(16))
+            regs.extend(f"i{i}" for i in range(16))
+        elif kind in {"src5", "src-noconst"}:
+            # 5-bit source fields only encode vN/rN. Constants require a 7-bit source slot.
+            regs.extend(f"v{i}" for i in range(16))
+            regs.extend(f"r{i}" for i in range(16))
+        else:
+            # 7-bit source fields encode vN/rN/cN.
+            regs.extend(f"v{i}" for i in range(16))
+            regs.extend(f"r{i}" for i in range(16))
+            regs.extend(f"c{i}" for i in range(96))
+        return [self.register_display_name(reg, dvle_index) for reg in regs]
+
+    def remove_register_alias(self, register: str, dvle_index: Optional[int] = None) -> None:
+        reg = native_register_from_display(register)
+        key = f"dvle:{dvle_index}" if dvle_index is not None else "global"
+        maps = self._symbol_maps()
+        if key in maps and reg in maps[key]:
+            del maps[key][reg]
+        self.parse()
+
+    def export_register_symbol_map(self, filename: str) -> None:
+        maps = self._symbol_maps()
+        payload: Dict[str, Any] = {
+            "format": "Cracko298.SHADER_REGISTER_SYMBOL_MAP.v1",
+            "source": os.path.basename(self.filename),
+            "global": maps.get("global", {}),
+            "dvles": [],
+        }
+        for dvle in self.dvles:
+            dvle_map: Dict[str, str] = dict(maps.get(f"dvle:{dvle.index}", {}))
+            for inp in dvle.inputs:
+                for reg_num in range(min(inp.start, inp.end), max(inp.start, inp.end) + 1):
+                    name = inp.name if inp.start == inp.end else f"{inp.name}[{reg_num - min(inp.start, inp.end)}]"
+                    if name:
+                        dvle_map.setdefault(f"v{reg_num}", name)
+            for out in dvle.outputs:
+                type_name = OUTPUT_TYPES.get(out.output_type, f"output_{out.output_type}")
+                dvle_map.setdefault(f"o{out.register_id}", type_name)
+            for c in dvle.constants:
+                if c.display_name and c.display_name != c.register_name:
+                    dvle_map.setdefault(c.register_name, c.display_name)
+            payload["dvles"].append({"index": dvle.index, "shader_type": dvle.shader_type_name, "registers": dvle_map})
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+    def import_register_symbol_map(self, filename: str) -> int:
+        with open(filename, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        maps = self._symbol_maps()
+        count = 0
+        if isinstance(payload, dict):
+            for reg, sym in (payload.get("global", {}) or {}).items():
+                maps.setdefault("global", {})[str(reg).lower()] = str(sym)
+                count += 1
+            if isinstance(payload.get("registers"), dict):
+                for reg, sym in payload["registers"].items():
+                    maps.setdefault("global", {})[str(reg).lower()] = str(sym)
+                    count += 1
+            for dvle_obj in payload.get("dvles", []) or []:
+                idx = dvle_obj.get("index")
+                if idx is None:
+                    continue
+                key = f"dvle:{int(idx)}"
+                for reg, sym in (dvle_obj.get("registers", {}) or {}).items():
+                    maps.setdefault(key, {})[str(reg).lower()] = str(sym)
+                    count += 1
+        self.parse()
+        return count
+
+    def export_full_asm(self, filename: str) -> None:
+        if not self.dvlp:
+            raise ValueError("No DVLP program loaded")
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"; Reassemblable PICA ASM from {os.path.basename(self.filename)}\n")
+            f.write(f"{ASM_CONTROL_COMMENT}\n")
+            f.write("; Keep the numeric prefix if you want safe in-place import.\n\n")
+            for dvle in self.dvles:
+                f.write(f"; DVLE {dvle.index} {dvle.shader_type_name}: entry={dvle.opcode_entry} end={dvle.opcode_end}\n")
+                aliases = self.symbol_to_register_map(dvle.index)
+                if aliases:
+                    f.write("; Aliases:\n")
+                    for sym, reg in sorted(aliases.items(), key=lambda kv: kv[1]):
+                        f.write(f";   {reg} = {sym}\n")
+                f.write("\n")
+            for inst in self.dvlp.instructions:
+                for lab in inst.fields.get("labels_here", []):
+                    name = str(lab.get("name") or f"label_{lab.get('opcode_address', inst.index)}").replace(" ", "_")
+                    f.write(f"{name}:\n")
+                ann = inst.fields.get("annotated_disasm", inst.disasm)
+                ann = str(ann)
+                desc = inst.fields.get("desc_id")
+                desc_comment = f" desc_id={desc}" if desc is not None else ""
+                f.write(f"{inst.index:04d}: {ann:<58} ; word=0x{inst.word:08X}{desc_comment}\n")
+
+    def import_full_asm(self, filename: str) -> int:
+        if not self.dvlp:
+            raise ValueError("No DVLP program loaded")
+        with open(filename, "r", encoding="utf-8") as f:
+            src_lines = f.readlines()
+        labels: Dict[str, int] = {}
+        next_index = 0
+        for raw in src_lines:
+            text = clean_asm_line(raw)
+            if not text:
+                continue
+            if text.endswith(":"):
+                labels[text[:-1].strip()] = next_index
+                continue
+            explicit, body = strip_asm_index_prefix(raw)
+            if not body:
+                continue
+            if explicit is not None:
+                next_index = explicit
+            if body.endswith(":"):
+                labels[body[:-1].strip()] = next_index
+                continue
+            next_index += 1
+
+        updated = 0
+        seq_index = 0
+        symbol_to_reg = self.symbol_to_register_map(None)
+        # Include per-DVLE alias names too; duplicate names prefer the first seen register.
+        for dvle in self.dvles:
+            for sym, reg in self.symbol_to_register_map(dvle.index).items():
+                symbol_to_reg.setdefault(sym, reg)
+        for raw in src_lines:
+            clean = clean_asm_line(raw)
+            if not clean or clean.endswith(":"):
+                continue
+            explicit, body = strip_asm_index_prefix(raw)
+            if not body or body.endswith(":"):
+                continue
+            idx = explicit if explicit is not None else seq_index
+            seq_index = idx + 1
+            if not (0 <= idx < self.dvlp.opcode_count):
+                continue
+            existing = self.dvlp.instructions[idx]
+            desc_id = int(existing.fields.get("desc_id", 0))
+            try:
+                word, opdesc_fields = parse_general_asm_line(body, base_word=existing.word, default_desc_id=desc_id, labels=labels, symbol_to_register=symbol_to_reg)
+            except ValueError:
+                continue
+            self.update_opcode_word(idx, word)
+            if opdesc_fields is not None and 0 <= desc_id < self.dvlp.opdesc_count:
+                old_desc, old_flags = self.dvlp.opdescs[desc_id]
+                desc, flags = pica_encode_opdesc(
+                    opdesc_fields.get("mask", "xyzw"),
+                    opdesc_fields.get("src1_swizzle", "xyzw"),
+                    opdesc_fields.get("src2_swizzle", "xyzw"),
+                    opdesc_fields.get("src3_swizzle", "xyzw"),
+                    bool(opdesc_fields.get("src1_neg", False)),
+                    bool(opdesc_fields.get("src2_neg", False)),
+                    bool(opdesc_fields.get("src3_neg", False)),
+                    preserve_flags=old_flags,
+                )
+                self.update_opdesc(desc_id, desc, flags)
+            updated += 1
+        self.parse()
+        return updated
+
+    def _target_adjusted_word(self, word: int, threshold: int, delta: int) -> int:
+        op = pica_effective_opcode(word)
+        fmt = pica_instruction_format(op, is_word=False)
+        if fmt not in {"2", "3"}:
+            return word & 0xFFFFFFFF
+        target = get_bits(word, 10, 12)
+        if delta > 0 and target >= threshold:
+            target += delta
+        elif delta < 0 and target > threshold:
+            target += delta
+        target = max(0, min(0xFFF, target))
+        return set_bits(word, 10, 12, target) & 0xFFFFFFFF
+
+    def insert_nop_instruction(self, index: int) -> None:
+        if not self.dvlp:
+            raise ValueError("No DVLP program loaded")
+        if not (0 <= index < self.dvlp.opcode_count):
+            raise IndexError("Instruction index out of range")
+        words = list(self.dvlp.opcodes)
+        words = [self._target_adjusted_word(w, index, +1) for w in words]
+        nop = pica_build_instruction_word("NOP")
+        words.insert(index, nop)
+        words = words[:self.dvlp.opcode_count]
+        for i, word in enumerate(words):
+            self.update_opcode_word(i, word)
+        self.parse()
+
+    def delete_instruction_shift_up(self, index: int) -> None:
+        if not self.dvlp:
+            raise ValueError("No DVLP program loaded")
+        if not (0 <= index < self.dvlp.opcode_count):
+            raise IndexError("Instruction index out of range")
+        words = list(self.dvlp.opcodes)
+        del words[index]
+        words.append(pica_build_instruction_word("NOP"))
+        words = [self._target_adjusted_word(w, index, -1) for w in words]
+        for i, word in enumerate(words[:self.dvlp.opcode_count]):
+            self.update_opcode_word(i, word)
+        self.parse()
+
+    def add_instruction_at_end_of_range(self, dvle_index: int, asm_line: str) -> int:
+        if not self.dvlp:
+            raise ValueError("No DVLP program loaded")
+        if not (0 <= dvle_index < len(self.dvles)):
+            raise IndexError("DVLE index out of range")
+        dvle = self.dvles[dvle_index]
+        idx = max(0, min(self.dvlp.opcode_count - 1, int(dvle.opcode_end)))
+        self.insert_nop_instruction(idx)
+        self.parse()
+        existing = self.dvlp.instructions[idx]
+        word, opdesc_fields = parse_general_asm_line(asm_line, base_word=existing.word, default_desc_id=int(existing.fields.get("desc_id", 0)), symbol_to_register=self.symbol_to_register_map(dvle_index))
+        self.update_opcode_word(idx, word)
+        self.parse()
+        return idx
+
+    def control_flow_graph(self, dvle_index: int = 0) -> Dict[str, Any]:
+        if not self.dvlp or not self.dvles:
+            return {"nodes": [], "edges": []}
+        dvle = self.dvles[max(0, min(dvle_index, len(self.dvles) - 1))]
+        start, end = sorted((int(dvle.opcode_entry), int(dvle.opcode_end)))
+        end = min(end, len(self.dvlp.instructions) - 1)
+        labels_by_addr: Dict[int, str] = {}
+        for lab in dvle.labels:
+            labels_by_addr[lab.opcode_address] = self._label_display_name(lab)
+        leaders = {start}
+        for inst in self.dvlp.instructions[start:end + 1]:
+            f = inst.fields
+            if inst.fmt in {"2", "3"}:
+                target = int(f.get("target", -1))
+                if start <= target <= end:
+                    leaders.add(target)
+                if inst.index + 1 <= end:
+                    leaders.add(inst.index + 1)
+            if inst.mnemonic.upper() == "END" and inst.index + 1 <= end:
+                leaders.add(inst.index + 1)
+        sorted_leaders = sorted(leaders)
+        nodes = []
+        for i, leader in enumerate(sorted_leaders):
+            block_end = (sorted_leaders[i + 1] - 1) if i + 1 < len(sorted_leaders) else end
+            label = labels_by_addr.get(leader, f"block_{leader:04d}")
+            nodes.append({"id": leader, "start": leader, "end": block_end, "label": label})
+        node_starts = {n["start"] for n in nodes}
+        edges = []
+        for node in nodes:
+            last = self.dvlp.instructions[node["end"]]
+            f = last.fields
+            kind = last.mnemonic.upper()
+            if last.fmt in {"2", "3"}:
+                target = int(f.get("target", -1))
+                if target in node_starts or start <= target <= end:
+                    edges.append({"from": node["start"], "to": target, "kind": kind.lower()})
+                if kind not in {"CALL", "CALLU"} and node["end"] + 1 <= end:
+                    edges.append({"from": node["start"], "to": node["end"] + 1, "kind": "fallthrough"})
+            elif kind != "END" and node["end"] + 1 <= end:
+                edges.append({"from": node["start"], "to": node["end"] + 1, "kind": "fallthrough"})
+        return {"dvle": dvle.index, "nodes": nodes, "edges": edges}
+
+    def register_lifetime_report(self, dvle_index: int = 0) -> str:
+        if not self.dvlp or not self.dvles:
+            return "No shader loaded."
+        dvle = self.dvles[max(0, min(dvle_index, len(self.dvles) - 1))]
+        start, end = sorted((int(dvle.opcode_entry), int(dvle.opcode_end)))
+        end = min(end, len(self.dvlp.instructions) - 1)
+        reads: Dict[str, List[int]] = {}
+        writes: Dict[str, List[int]] = {}
+        deps: Dict[str, set] = {}
+        def reg_src(raw: int) -> str:
+            reg = pica_src_reg_name(raw)
+            alias = self.register_alias(reg, dvle.index)
+            return f"{reg}<{alias}>" if alias else reg
+        def reg_dst(raw: int) -> str:
+            reg = pica_dest_reg_name(raw)
+            alias = self.register_alias(reg, dvle.index)
+            return f"{reg}<{alias}>" if alias else reg
+        for inst in self.dvlp.instructions[start:end + 1]:
+            f = inst.fields
+            srcs = []
+            for key in ("src1_raw", "src2_raw", "src3_raw"):
+                if key in f:
+                    srcs.append(reg_src(int(f[key])))
+            for rname in srcs:
+                reads.setdefault(rname, []).append(inst.index)
+            if "dst_raw" in f:
+                dst = reg_dst(int(f["dst_raw"]))
+                writes.setdefault(dst, []).append(inst.index)
+                combined = set(srcs)
+                for sreg in srcs:
+                    combined.update(deps.get(sreg, set()))
+                deps[dst] = combined
+        regs = sorted(set(reads) | set(writes), key=lambda x: (x[0], x))
+        lines = [f"Register lifetime/dependency report for DVLE {dvle.index} ({dvle.shader_type_name})", f"Range: {start}..{end}", ""]
+        for reg in regs:
+            all_uses = reads.get(reg, []) + writes.get(reg, [])
+            lifetime = f"{min(all_uses)}..{max(all_uses)}" if all_uses else "-"
+            lines.append(f"{reg:34} life={lifetime:>9} reads={reads.get(reg, [])} writes={writes.get(reg, [])}")
+            if deps.get(reg):
+                lines.append(f"{'':34} depends on: {', '.join(sorted(deps[reg]))}")
+        if not regs:
+            lines.append("No register reads/writes decoded in this DVLE range.")
+        return "\n".join(lines)
+
+    def safety_issues(self) -> List[ParseIssue]:
+        issues: List[ParseIssue] = list(self.issues)
+        if not self.dvlp:
+            return issues
+        used_opdescs = set()
+        for dvle in self.dvles:
+            start, end = sorted((int(dvle.opcode_entry), int(dvle.opcode_end)))
+            if start < 0 or end >= len(self.dvlp.instructions):
+                issues.append(ParseIssue("error", f"DVLE {dvle.index} opcode range {start}..{end} is outside the opcode table"))
+                continue
+            has_end = any(inst.mnemonic.upper() == "END" for inst in self.dvlp.instructions[start:end + 1])
+            if not has_end:
+                issues.append(ParseIssue("warning", f"DVLE {dvle.index} has no END instruction in its active range"))
+            declared_outputs = {int(o.register_id) for o in dvle.outputs}
+            declared_consts = {int(c.register_id) for c in dvle.constants if c.entry_type == 2}
+            written_temps = set()
+            for inst in self.dvlp.instructions[start:end + 1]:
+                f = inst.fields
+                desc_id = f.get("desc_id")
+                if isinstance(desc_id, int):
+                    used_opdescs.add(desc_id)
+                    if not (0 <= desc_id < self.dvlp.opdesc_count):
+                        issues.append(ParseIssue("error", f"Instruction {inst.index} references missing opdesc {desc_id}"))
+                for key in ("src1_raw", "src2_raw", "src3_raw"):
+                    if key not in f:
+                        continue
+                    raw = int(f[key])
+                    if 0x10 <= raw < 0x20 and (raw - 0x10) not in written_temps:
+                        issues.append(ParseIssue("warning", f"Instruction {inst.index} reads temp r{raw - 0x10} before a decoded write in DVLE {dvle.index}"))
+                    if raw >= 0x20 and (raw - 0x20) not in declared_consts and not self.register_alias(f"c{raw - 0x20}", dvle.index):
+                        issues.append(ParseIssue("info", f"Instruction {inst.index} reads c{raw - 0x20}, which is not in the constant table/symbol map for DVLE {dvle.index}"))
+                if "dst_raw" in f:
+                    dst = int(f["dst_raw"])
+                    if dst >= 0x10:
+                        written_temps.add(dst - 0x10)
+                    elif dst not in declared_outputs and not self.register_alias(f"o{dst}", dvle.index):
+                        issues.append(ParseIssue("warning", f"Instruction {inst.index} writes o{dst}, not declared in DVLE {dvle.index}'s output table"))
+                if inst.fmt in {"2", "3"}:
+                    target = int(f.get("target", -1))
+                    if not (start <= target <= end):
+                        issues.append(ParseIssue("warning", f"Instruction {inst.index} branch/call target {target} is outside DVLE {dvle.index} range {start}..{end}"))
+        for i in range(self.dvlp.opdesc_count):
+            if i not in used_opdescs:
+                issues.append(ParseIssue("info", f"Opdesc {i} is unused by decoded instructions"))
+        return issues
+
     def export_disassembly(self, filename: str) -> None:
         if not self.dvlp:
             raise ValueError("No DVLP program loaded")
@@ -1476,7 +2246,8 @@ class SHBINParser:
             },
             "dvlp": self._dvlp_to_dict(),
             "dvles": [self._dvle_to_dict(dvle) for dvle in self.dvles],
-            "issues": [{"level": i.level, "message": i.message} for i in self.issues],
+            "issues": [{"level": i.level, "message": i.message} for i in self.safety_issues()],
+            "register_symbol_maps": self._symbol_maps(),
         }
 
     def _dvlp_to_dict(self) -> Optional[Dict[str, Any]]:
@@ -1588,7 +2359,6 @@ class SHBINParser:
                     ])
 
     def import_constant_values_json(self, filename: str) -> int:
-        """Import values from an exported JSON. Returns number of constants updated."""
         with open(filename, "r", encoding="utf-8") as f:
             payload = json.load(f)
 
@@ -1610,7 +2380,7 @@ class SHBINParser:
                     continue
                 self.update_constant(dvle_index, target.index, new_raw)
                 updated += 1
-        self.parse()  # Refresh parsed views after edits.
+        self.parse()  # Refresh the parsed views after editting assembly. Also forgot this... lmfao
         return updated
 
     def _find_constant_for_import(self, dvle_index: int, cobj: Dict[str, Any]) -> Optional[ShaderConstant]:
@@ -1650,16 +2420,24 @@ class SHBINParser:
 
     def validation_report(self) -> str:
         lines = []
-        if not self.issues:
-            lines.append("No parse issues found.")
+        issues = self.safety_issues()
+        if not issues:
+            lines.append("No parse/safety issues found.")
         else:
-            for issue in self.issues:
+            for issue in issues:
                 lines.append(f"[{issue.level.upper()}] {issue.message}")
         if self.dvlp:
             lines.append("")
             lines.append(f"DVLP: {self.dvlp.opcode_count} opcodes, {self.dvlp.opdesc_count} opdescs, {len(self.dvlp.filenames)} source filename symbols")
         for dvle in self.dvles:
             lines.append(f"DVLE {dvle.index}: {dvle.shader_type_name}, {len(dvle.constants)} constants, {len(dvle.inputs)} inputs, {len(dvle.outputs)} outputs, {len(dvle.labels)} labels")
+        maps = self._symbol_maps()
+        if maps:
+            lines.append("")
+            lines.append("User/default register symbol maps:")
+            for scope, regs in maps.items():
+                if regs:
+                    lines.append(f"  {scope}: " + ", ".join(f"{r}={n}" for r, n in sorted(regs.items())))
         return "\n".join(lines)
 
 
@@ -1694,17 +2472,19 @@ class ShaderPreview3D(ttk.LabelFrame):
 
         controls = ttk.Frame(self)
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Label(controls, text="Shader:").pack(side=tk.LEFT)
-        self.shader_combo = ttk.Combobox(controls, textvariable=self.shader_var, state="readonly", width=18)
-        self.shader_combo.pack(side=tk.LEFT, padx=(4, 8))
+        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(3, weight=1)
+        ttk.Label(controls, text="Shader:").grid(row=0, column=0, sticky="w")
+        self.shader_combo = ttk.Combobox(controls, textvariable=self.shader_var, state="readonly", width=10)
+        self.shader_combo.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=(0, 2))
         self.shader_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_shader_combo())
-        ttk.Label(controls, text="Mesh:").pack(side=tk.LEFT)
-        mesh_combo = ttk.Combobox(controls, textvariable=self.mesh_var, state="readonly", width=10, values=["Cube", "Plane", "Pyramid"])
-        mesh_combo.pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(controls, text="Mesh:").grid(row=1, column=0, sticky="w")
+        mesh_combo = ttk.Combobox(controls, textvariable=self.mesh_var, state="readonly", width=8, values=["Cube", "Plane", "Pyramid", "Sphere", "UV Sphere"])
+        mesh_combo.grid(row=1, column=1, sticky="ew", padx=(4, 8))
         mesh_combo.bind("<<ComboboxSelected>>", lambda _e: self.redraw())
-        ttk.Label(controls, text="Material:").pack(side=tk.LEFT)
-        material_combo = ttk.Combobox(controls, textvariable=self.material_var, state="readonly", width=9, values=["Preview", "Shader", "Mixed"])
-        material_combo.pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(controls, text="Material:").grid(row=1, column=2, sticky="w")
+        material_combo = ttk.Combobox(controls, textvariable=self.material_var, state="readonly", width=8, values=["Preview", "Shader", "Mixed"])
+        material_combo.grid(row=1, column=3, sticky="ew", padx=(4, 0))
         material_combo.bind("<<ComboboxSelected>>", lambda _e: self.redraw())
 
         controls2 = ttk.Frame(self)
@@ -1726,16 +2506,16 @@ class ShaderPreview3D(ttk.LabelFrame):
         self._light_slider(light_box, 5, "Ambient", self.ambient_var, 0.0, 1.0)
         light_box.columnconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(self, width=360, height=520, bg="#141820", highlightthickness=1, highlightbackground="#2b3240")
+        self.canvas = tk.Canvas(self, width=420, height=420, bg="#141820", highlightthickness=1, highlightbackground="#2b3240")
         self.canvas.grid(row=3, column=0, sticky="nsew")
         self.info_var = tk.StringVar(value=self._last_render_note)
-        self.info = ttk.Label(self, textvariable=self.info_var, anchor=tk.W, justify=tk.LEFT, wraplength=340)
+        self.info = ttk.Label(self, textvariable=self.info_var, anchor=tk.W, justify=tk.LEFT, wraplength=380)
         self.info.grid(row=4, column=0, sticky="ew", pady=(4, 0))
 
         self.rowconfigure(3, weight=1)
         self.columnconfigure(0, weight=1)
 
-        self.canvas.bind("<Configure>", lambda _e: self.redraw())
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.canvas.bind("<ButtonPress-1>", self._start_drag)
         self.canvas.bind("<B1-Motion>", self._drag)
         self.canvas.bind("<MouseWheel>", self._wheel)
@@ -1806,6 +2586,13 @@ class ShaderPreview3D(ttk.LabelFrame):
         var.trace_add("write", update_label)
         update_label()
 
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        try:
+            self.info.configure(wraplength=max(180, int(event.width) - 14))
+        except Exception:
+            pass
+        self.redraw()
+
     def _on_shader_combo(self) -> None:
         text = self.shader_var.get().strip()
         if text.startswith("DVLE "):
@@ -1871,6 +2658,39 @@ class ShaderPreview3D(ttk.LabelFrame):
                 {"pos": (0.0, 1.05, 0.0, 1.0), "normal": (0.0, 1.0, 0.0, 0.0), "uv": (0.5, 0.5, 0.0, 1.0), "color": (1.0, 0.45, 1.0, 1.0)},
             ]
             return verts, [(0, 1, 2), (0, 2, 3), (0, 4, 1), (1, 4, 2), (2, 4, 3), (3, 4, 0)]
+        if name in {"Sphere", "UV Sphere"}:
+            rings = 10 if name == "Sphere" else 14
+            segments = 18 if name == "Sphere" else 26
+            verts: List[Dict[str, Any]] = []
+            for y in range(rings + 1):
+                v = y / rings
+                theta = math.pi * v
+                sy = math.cos(theta)
+                rr = math.sin(theta)
+                for x in range(segments):
+                    u = x / segments
+                    phi = 2.0 * math.pi * u
+                    px = rr * math.cos(phi)
+                    pz = rr * math.sin(phi)
+                    py = sy
+                    verts.append({
+                        "pos": (px, py, pz, 1.0),
+                        "normal": (px, py, pz, 0.0),
+                        "uv": (u, v, 0.0, 1.0),
+                        "color": (0.25 + 0.75 * u, 0.25 + 0.75 * (1.0 - v), 0.55 + 0.35 * abs(pz), 1.0),
+                    })
+            faces: List[Tuple[int, int, int]] = []
+            for y in range(rings):
+                for x in range(segments):
+                    a = y * segments + x
+                    b = y * segments + ((x + 1) % segments)
+                    c = (y + 1) * segments + ((x + 1) % segments)
+                    d = (y + 1) * segments + x
+                    if y != 0:
+                        faces.append((a, b, d))
+                    if y != rings - 1:
+                        faces.append((b, c, d))
+            return verts, faces
         coords = [
             (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
             (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
@@ -1956,8 +2776,8 @@ class ShaderPreview3D(ttk.LabelFrame):
         shader = [sum(shader_colors[i][j] for i in face) / 3.0 for j in range(3)]
 
         shader_is_black = max(abs(x) for x in shader) < 0.035
-        if mode == "shader" and not shader_is_black:
-            return self._safe_rgb(shader, floor=0.02)
+        if mode == "shader":
+            return self._safe_rgb(shader, floor=0.0)
         if mode == "mixed" and not shader_is_black:
             return self._safe_rgb([(preview[i] * 0.45) + (shader[i] * 0.55) for i in range(3)], floor=0.04)
         return self._safe_rgb(preview, floor=0.12)
@@ -2091,7 +2911,9 @@ class ShaderPreview3D(ttk.LabelFrame):
         x, z = x * cy + z * sy, -x * sy + z * cy
         y, z = y * cp - z * sp, y * sp + z * cp
         dist = 4.0
-        persp = self.zoom / max(0.25, z + dist)
+        base = max(80.0, float(min(width, height)))
+        dynamic_zoom = base * 0.62 * (float(self.zoom) / 260.0)
+        persp = dynamic_zoom / max(0.25, z + dist)
         return width * 0.5 + x * persp, height * 0.52 - y * persp, z
 
     def _draw_grid(self, width: int, height: int) -> None:
@@ -2236,8 +3058,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1540x820")
-        self.minsize(1180, 650)
+        self._configure_initial_window()
         self.parser = SHBINParser()
         self.selected_constant: Optional[Tuple[int, int]] = None
         self.selected_instruction: Optional[int] = None
@@ -2272,7 +3093,28 @@ class App(tk.Tk):
         self.opdesc_src1_neg_var = tk.BooleanVar(value=False)
         self.opdesc_src2_neg_var = tk.BooleanVar(value=False)
         self.opdesc_src3_neg_var = tk.BooleanVar(value=False)
+        self.cfg_dvle_var = tk.StringVar(value="0")
+        self.analysis_dvle_var = tk.StringVar(value="0")
+        self.symbol_dvle_var = tk.StringVar(value="global")
+        self.symbol_register_var = tk.StringVar(value="c17")
+        self.symbol_name_var = tk.StringVar(value="CHUNK_ORIGIN_AND_SCALE")
+        self.instr_register_widgets: Dict[str, ttk.Combobox] = {}
+        self.symbol_tree: Optional[ttk.Treeview] = None
+        self.symbol_register_combo: Optional[ttk.Combobox] = None
+        self.symbol_scope_combo: Optional[ttk.Combobox] = None
         self._build_ui()
+
+    def _configure_initial_window(self) -> None:
+        try:
+            sw, sh = int(self.winfo_screenwidth()), int(self.winfo_screenheight())
+        except Exception:
+            sw, sh = 1540, 820
+        width = min(1540, max(980, int(sw * 0.92)))
+        height = min(900, max(620, int(sh * 0.86)))
+        x = max(0, (sw - width) // 2)
+        y = max(0, (sh - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(min(980, max(760, sw - 120)), min(600, max(520, sh - 140)))
 
     def _build_ui(self) -> None:
         self._build_toolbar()
@@ -2281,8 +3123,27 @@ class App(tk.Tk):
         self._set_status("Open a .shbin / DVLB file to begin.")
 
     def _build_toolbar(self) -> None:
-        toolbar = ttk.Frame(self, padding=(4, 4))
-        toolbar.pack(side=tk.TOP, fill=tk.X)
+        toolbar_outer = ttk.Frame(self, padding=(4, 4))
+        toolbar_outer.pack(side=tk.TOP, fill=tk.X)
+        toolbar_outer.columnconfigure(0, weight=1)
+
+        self.toolbar_canvas = tk.Canvas(toolbar_outer, highlightthickness=0, height=34)
+        self.toolbar_canvas.grid(row=0, column=0, sticky="ew")
+        self.toolbar_scroll = ttk.Scrollbar(toolbar_outer, orient=tk.HORIZONTAL, command=self.toolbar_canvas.xview)
+        self.toolbar_scroll.grid(row=1, column=0, sticky="ew")
+        self.toolbar_canvas.configure(xscrollcommand=self.toolbar_scroll.set)
+        toolbar = ttk.Frame(self.toolbar_canvas)
+        self.toolbar_window = self.toolbar_canvas.create_window((0, 0), window=toolbar, anchor="nw")
+
+        def _sync_toolbar(_event: Optional[tk.Event] = None) -> None:
+            try:
+                self.toolbar_canvas.configure(scrollregion=self.toolbar_canvas.bbox("all"))
+                self.toolbar_canvas.configure(height=max(30, toolbar.winfo_reqheight()))
+            except Exception:
+                pass
+
+        toolbar.bind("<Configure>", _sync_toolbar)
+        self.toolbar_canvas.bind("<Configure>", _sync_toolbar)
 
         ttk.Button(toolbar, text="Open .shbin", command=self.open_file).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Save", command=self.save_file).pack(side=tk.LEFT, padx=2)
@@ -2292,42 +3153,58 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="Import JSON Values", command=self.import_json_values).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Export Constants CSV", command=self.export_csv).pack(side=tk.LEFT, padx=2)
         ttk.Button(toolbar, text="Export Disasm", command=self.export_disassembly).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Export Full ASM", command=self.export_full_asm).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Import Full ASM", command=self.import_full_asm).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Button(toolbar, text="Symbols", command=self.show_symbol_tools).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Export Symbol Map", command=self.export_symbol_map).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Import Symbol Map", command=self.import_symbol_map).pack(side=tk.LEFT, padx=2)
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(toolbar, text="Validate", command=self.show_validation).pack(side=tk.LEFT, padx=2)
-
-        ttk.Label(toolbar, text="Filter:").pack(side=tk.LEFT, padx=(16, 4))
-        filter_entry = ttk.Entry(toolbar, textvariable=self.filter_var, width=30)
-        filter_entry.pack(side=tk.LEFT, padx=2)
-        filter_entry.bind("<KeyRelease>", lambda _e: self.refresh_tree())
-        ttk.Button(toolbar, text="Clear", command=lambda: (self.filter_var.set(""), self.refresh_tree())).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Analyze Regs", command=self.show_register_lifetimes).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="CFG", command=self.refresh_cfg).pack(side=tk.LEFT, padx=2)
 
     def _build_body(self) -> None:
         paned = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
+        self.main_paned = paned
+        self._pane_resize_job: Optional[str] = None
+        self._pane_first_fit = True
 
         left = ttk.Frame(paned, padding=4)
+        self.left_pane = left
         paned.add(left, weight=1)
+        filter_bar = ttk.Frame(left)
+        filter_bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        filter_bar.columnconfigure(1, weight=1)
+        ttk.Label(filter_bar, text="Filter:").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        filter_entry = ttk.Entry(filter_bar, textvariable=self.filter_var)
+        filter_entry.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        filter_entry.bind("<KeyRelease>", lambda _e: self.refresh_tree())
+        ttk.Button(filter_bar, text="Clear", command=lambda: (self.filter_var.set(""), self.refresh_tree())).grid(row=0, column=2, sticky="e")
 
         self.tree = ttk.Treeview(left, columns=("Kind", "Info"), show="tree headings")
         self.tree.heading("#0", text="Section / Entry")
         self.tree.heading("Kind", text="Kind")
         self.tree.heading("Info", text="Info")
-        self.tree.column("#0", width=310, minwidth=200)
-        self.tree.column("Kind", width=110, anchor=tk.W)
-        self.tree.column("Info", width=260, anchor=tk.W)
+        self.tree.column("#0", width=420, minwidth=80, stretch=True)
+        self.tree.column("Kind", width=70, minwidth=40, anchor=tk.W, stretch=False)
+        self.tree.column("Info", width=90, minwidth=40, anchor=tk.W, stretch=False)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        self.tree.bind("<Configure>", self._fit_tree_columns)
 
         yscroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.tree.yview)
         xscroll = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.tree.xview)
         self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        left.rowconfigure(0, weight=1)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+        yscroll.grid(row=1, column=1, sticky="ns")
+        xscroll.grid(row=2, column=0, sticky="ew")
+        left.rowconfigure(1, weight=1)
         left.columnconfigure(0, weight=1)
 
         right = ttk.Frame(paned, padding=4)
-        paned.add(right, weight=2)
+        self.center_pane = right
+        paned.add(right, weight=3)
 
         self.notebook = ttk.Notebook(right)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -2341,12 +3218,94 @@ class App(tk.Tk):
         self.notebook.add(self.opdesc_frame, text="Edit Opdesc")
         self.hex_text = self._make_text_tab("Hex View")
         self.raw_text = self._make_text_tab("Raw Tables")
+        self.analysis_text = self._make_text_tab("Register Analysis")
+        self.symbol_frame = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(self.symbol_frame, text="Symbol Map")
+        self.cfg_frame = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(self.cfg_frame, text="Control Flow")
         self._build_edit_tab()
         self._build_instruction_tab()
         self._build_opdesc_tab()
+        self._build_symbol_tab()
+        self._build_cfg_tab()
 
         self.preview = ShaderPreview3D(paned)
-        paned.add(self.preview, weight=1)
+        paned.add(self.preview, weight=2)
+        for child, minsize in ((left, 260), (right, 420), (self.preview, 220)):
+            try:
+                paned.paneconfigure(child, minsize=minsize)
+            except Exception:
+                pass
+        paned.bind("<Configure>", self._queue_fit_main_panes)
+        self.after_idle(lambda: self._fit_main_panes(force=True))
+
+    def _queue_fit_main_panes(self, _event: Optional[tk.Event] = None) -> None:
+        try:
+            if self._pane_resize_job:
+                self.after_cancel(self._pane_resize_job)
+        except Exception:
+            pass
+        self._pane_resize_job = self.after(80, self._fit_main_panes)
+
+    def _fit_main_panes(self, force: bool = False) -> None:
+        paned = getattr(self, "main_paned", None)
+        if paned is None:
+            return
+        try:
+            total = int(paned.winfo_width())
+        except Exception:
+            return
+        if total < 700:
+            return
+
+        target_left = max(340, min(520, int(total * 0.30)))
+        target_preview = max(280, min(460, int(total * 0.24)))
+        min_center = 500
+        if target_left + target_preview + min_center > total:
+            target_left = max(300, min(target_left, int(total * 0.28)))
+            target_preview = max(240, min(target_preview, total - target_left - min_center))
+        target_preview = max(230, target_preview)
+        second_sash = max(target_left + min_center, total - target_preview)
+
+        try:
+            cur_left = int(paned.sashpos(0))
+            cur_second = int(paned.sashpos(1))
+            cur_preview = total - cur_second
+            cur_center = cur_second - cur_left
+        except Exception:
+            cur_preview = cur_center = 0
+
+        needs_fit = bool(force or getattr(self, "_pane_first_fit", False) or cur_preview < 230 or cur_center < 460)
+        if not needs_fit:
+            return
+        try:
+            paned.sashpos(0, target_left)
+            paned.sashpos(1, second_sash)
+            self._pane_first_fit = False
+        except Exception:
+            pass
+
+    def _fit_tree_columns(self, _event: Optional[tk.Event] = None) -> None:
+        tree = getattr(self, "tree", None)
+        if tree is None:
+            return
+        try:
+            width = int(tree.winfo_width())
+        except Exception:
+            return
+        if width <= 80:
+            return
+
+        usable = max(80, width - 26)
+        kind_w = max(48, min(78, int(usable * 0.14)))
+        info_w = max(52, min(112, int(usable * 0.18)))
+        section_w = max(120, usable - kind_w - info_w)
+        try:
+            tree.column("#0", width=section_w, minwidth=60, stretch=True)
+            tree.column("Kind", width=kind_w, minwidth=40, stretch=False)
+            tree.column("Info", width=info_w, minwidth=40, stretch=False)
+        except Exception:
+            pass
 
     def _make_text_tab(self, title: str) -> tk.Text:
         frame = ttk.Frame(self.notebook)
@@ -2406,7 +3365,10 @@ class App(tk.Tk):
         ttk.Button(self.instruction_frame, text="Apply Raw", command=self.apply_instruction_raw).grid(row=2, column=2, sticky="ew", pady=3)
         ttk.Label(self.instruction_frame, text="Mnemonic").grid(row=2, column=3, sticky="e", padx=(16, 4), pady=3)
         values = sorted(set(MNEMONIC_TO_OPCODE.keys()) - {"EXP", "LOG", "LIT"})
-        ttk.Combobox(self.instruction_frame, textvariable=self.instr_mnemonic_var, values=values, width=12).grid(row=2, column=4, sticky="ew", padx=(4, 8), pady=3)
+        self.instr_mnemonic_combo = ttk.Combobox(self.instruction_frame, textvariable=self.instr_mnemonic_var, values=values, width=12)
+        self.instr_mnemonic_combo.grid(row=2, column=4, sticky="ew", padx=(4, 8), pady=3)
+        self.instr_mnemonic_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_instruction_register_choices(None))
+        self.instr_mnemonic_combo.bind("<KeyRelease>", lambda _e: self.after_idle(lambda: self._refresh_instruction_register_choices(None)))
         ttk.Button(self.instruction_frame, text="Apply Fields", command=self.apply_instruction_fields).grid(row=2, column=5, sticky="ew", pady=3)
 
         fields = [
@@ -2417,22 +3379,52 @@ class App(tk.Tk):
             ("CmpX", self.instr_cmpx_var), ("CmpY", self.instr_cmpy_var),
         ]
         row = 3
+        self.instr_register_widgets = {}
         for i, (label, var) in enumerate(fields):
-            r = row + i // 3
-            c = (i % 3) * 2
+            r = row + i // 2
+            c = 0 if i % 2 == 0 else 3
             ttk.Label(self.instruction_frame, text=label).grid(row=r, column=c, sticky="w", pady=3)
-            ttk.Entry(self.instruction_frame, textvariable=var, width=16).grid(row=r, column=c + 1, sticky="ew", padx=(4, 10), pady=3)
+            if label in {"DST", "SRC1", "SRC2", "SRC3", "Bool/Int ID", "CondOp", "CmpX", "CmpY"}:
+                combo = ttk.Combobox(self.instruction_frame, textvariable=var, width=24)
+                if label == "CondOp":
+                    combo.configure(values=[CONDOP_NAMES[i] for i in sorted(CONDOP_NAMES)])
+                elif label in {"CmpX", "CmpY"}:
+                    combo.configure(values=[CMP_OP_NAMES[i] for i in sorted(CMP_OP_NAMES)])
+                combo.grid(row=r, column=c + 1, columnspan=2, sticky="ew", padx=(4, 10), pady=3)
+                self.instr_register_widgets[label] = combo
+            else:
+                ttk.Entry(self.instruction_frame, textvariable=var, width=18).grid(row=r, column=c + 1, columnspan=2, sticky="ew", padx=(4, 10), pady=3)
+
+        bottom_row = row + (len(fields) + 1) // 2
+        instr_btns = ttk.Frame(self.instruction_frame)
+        instr_btns.grid(row=bottom_row, column=0, columnspan=6, sticky="ew", pady=(10, 0))
+        for i, (text, command) in enumerate([
+            ("Insert NOP Before", self.insert_nop_before_selected),
+            ("Delete / Shift Up", self.delete_selected_instruction),
+            ("Add ASM Near DVLE End", self.add_asm_instruction_to_active_dvle),
+        ]):
+            ttk.Button(instr_btns, text=text, command=command).grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+            instr_btns.columnconfigure(i, weight=1)
 
         help_text = (
             "ASM patching supports arithmetic forms like: add r0.xy, v0.xyzw, c0.xyzw  |  "
             "mul r1, r0, c5  |  dp3 o0.xyz, r0, c2  |  mad r2, r0, c1, r1.\n"
-            "For flow-control and unknown instructions, use raw/field editing. Registers accept names like v0/r3/c12/o0 or raw integers."
+            "Flow-control can be edited directly in the ASM line now. Unused dropdowns are disabled per mnemonic. "
+            "Register fields accept native names, plain symbols, or dropdown values like CHUNK_ORIGIN_AND_SCALE (c17)."
         )
-        ttk.Label(self.instruction_frame, text=help_text, foreground="#555", wraplength=760, justify=tk.LEFT).grid(
-            row=9, column=0, columnspan=6, sticky="w", pady=(16, 0)
-        )
-        for col in range(6):
-            self.instruction_frame.columnconfigure(col, weight=1)
+        self.instr_help_label = ttk.Label(self.instruction_frame, text=help_text, foreground="#555", wraplength=760, justify=tk.LEFT)
+        self.instr_help_label.grid(row=bottom_row + 1, column=0, columnspan=6, sticky="w", pady=(16, 0))
+        self.instruction_frame.bind("<Configure>", self._fit_instruction_help_text)
+
+        for col, weight in enumerate((0, 1, 1, 0, 1, 1)):
+            self.instruction_frame.columnconfigure(col, weight=weight)
+
+    def _fit_instruction_help_text(self, event: Optional[tk.Event] = None) -> None:
+        try:
+            width = int(event.width if event is not None else self.instruction_frame.winfo_width())
+            self.instr_help_label.configure(wraplength=max(360, width - 32))
+        except Exception:
+            pass
 
     def _build_opdesc_tab(self) -> None:
         self.opdesc_header_label = ttk.Label(self.opdesc_frame, text="Select an operand descriptor to edit.", font=("Segoe UI", 10, "bold"))
@@ -2470,6 +3462,68 @@ class App(tk.Tk):
         for col in range(5):
             self.opdesc_frame.columnconfigure(col, weight=1)
 
+
+    def _build_symbol_tab(self) -> None:
+        ttk.Label(self.symbol_frame, text="Register Symbol Table Editor", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 8))
+
+        ttk.Label(self.symbol_frame, text="Scope/DVLE").grid(row=1, column=0, sticky="w", pady=3)
+        self.symbol_scope_combo = ttk.Combobox(self.symbol_frame, textvariable=self.symbol_dvle_var, width=12, values=["global"])
+        self.symbol_scope_combo.grid(row=1, column=1, sticky="ew", padx=(4, 8), pady=3)
+        ttk.Label(self.symbol_frame, text="Register").grid(row=1, column=2, sticky="w", pady=3)
+        self.symbol_register_combo = ttk.Combobox(self.symbol_frame, textvariable=self.symbol_register_var, width=24)
+        self.symbol_register_combo.grid(row=1, column=3, sticky="ew", padx=(4, 0), pady=3)
+
+        ttk.Label(self.symbol_frame, text="Symbol name").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(self.symbol_frame, textvariable=self.symbol_name_var).grid(row=2, column=1, columnspan=3, sticky="ew", padx=(4, 0), pady=3)
+        ttk.Button(self.symbol_frame, text="Load Selected", command=self.load_selected_symbol_row).grid(row=2, column=4, sticky="ew", padx=(8, 0), pady=3)
+
+        btns = ttk.Frame(self.symbol_frame)
+        btns.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(8, 8))
+        ttk.Button(btns, text="Apply / Update Alias", command=self.apply_register_alias).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Delete Alias", command=self.delete_register_alias).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Export Symbol Map", command=self.export_symbol_map).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Import Symbol Map", command=self.import_symbol_map).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btns, text="Refresh", command=self.show_symbol_tools).pack(side=tk.LEFT)
+
+        self.symbol_tree = ttk.Treeview(self.symbol_frame, columns=("Scope", "Register", "Symbol", "Source"), show="headings", height=10)
+        for col, width in [("Scope", 105), ("Register", 90), ("Symbol", 300), ("Source", 185)]:
+            self.symbol_tree.heading(col, text=col)
+            self.symbol_tree.column(col, width=width, anchor=tk.W)
+        self.symbol_tree.grid(row=4, column=0, columnspan=4, sticky="nsew")
+        self.symbol_tree.bind("<<TreeviewSelect>>", self.on_symbol_table_select)
+        sy = ttk.Scrollbar(self.symbol_frame, orient=tk.VERTICAL, command=self.symbol_tree.yview)
+        sy.grid(row=4, column=4, sticky="ns")
+        self.symbol_tree.configure(yscrollcommand=sy.set)
+
+        self.symbol_text = tk.Text(self.symbol_frame, wrap=tk.NONE, font=("Consolas", 9), height=7)
+        self.symbol_text.grid(row=5, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
+        yscroll = ttk.Scrollbar(self.symbol_frame, orient=tk.VERTICAL, command=self.symbol_text.yview)
+        yscroll.grid(row=5, column=4, sticky="ns", pady=(8, 0))
+        self.symbol_text.configure(yscrollcommand=yscroll.set)
+
+        help_text = (
+            "This editor creates register aliases used by disassembly, direct ASM editing, field dropdowns, full ASM import/export, and reports. "
+            "It does not create new hardware registers; it maps names onto existing PICA registers like c17, v0, o2, r3, b0, or i0."
+        )
+        ttk.Label(self.symbol_frame, text=help_text, foreground="#555", wraplength=860, justify=tk.LEFT).grid(row=6, column=0, columnspan=5, sticky="w", pady=(10, 0))
+        self.symbol_frame.columnconfigure(1, weight=1)
+        self.symbol_frame.columnconfigure(3, weight=2)
+        self.symbol_frame.rowconfigure(4, weight=2)
+        self.symbol_frame.rowconfigure(5, weight=1)
+
+    def _build_cfg_tab(self) -> None:
+        top = ttk.Frame(self.cfg_frame)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(top, text="DVLE:").pack(side=tk.LEFT)
+        ttk.Entry(top, textvariable=self.cfg_dvle_var, width=6).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Button(top, text="Refresh graph", command=self.refresh_cfg).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(top, text="Show register lifetimes", command=self.show_register_lifetimes).pack(side=tk.LEFT)
+        self.cfg_canvas = tk.Canvas(self.cfg_frame, bg="#10141b", highlightthickness=1, highlightbackground="#2b3240")
+        self.cfg_canvas.grid(row=1, column=0, sticky="nsew")
+        self.cfg_frame.rowconfigure(1, weight=1)
+        self.cfg_frame.columnconfigure(0, weight=1)
+        self.cfg_canvas.bind("<Configure>", lambda _e: self.refresh_cfg(redraw_only=True))
+
     def _build_statusbar(self) -> None:
         self.status_var = tk.StringVar()
         status = ttk.Label(self, textvariable=self.status_var, anchor=tk.W, padding=(4, 2), relief=tk.SUNKEN)
@@ -2494,6 +3548,7 @@ class App(tk.Tk):
             messagebox.showerror("Open failed", str(exc))
             return
         self.refresh_tree()
+        self.refresh_symbol_table()
         self.show_overview()
         self.preview.set_shader(self.parser)
         self._set_status(f"Loaded {os.path.basename(path)} | {len(self.parser.data):,} bytes | {len(self.parser.dvles)} DVLE(s)")
@@ -2575,6 +3630,400 @@ class App(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Disassembly export failed", str(exc))
 
+
+    def export_full_asm(self) -> None:
+        if not self._require_loaded():
+            return
+        default = Path(self.parser.filename).with_suffix(".full.pica.asm").name if self.parser.filename else "shader.full.pica.asm"
+        path = filedialog.asksaveasfilename(initialfile=default, defaultextension=".asm", filetypes=[("Assembly text", "*.asm *.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.parser.export_full_asm(path)
+            self._set_status(f"Exported reassemblable full ASM to {os.path.basename(path)}.")
+        except Exception as exc:
+            messagebox.showerror("Full ASM export failed", str(exc))
+
+    def import_full_asm(self) -> None:
+        if not self._require_loaded():
+            return
+        path = filedialog.askopenfilename(filetypes=[("Assembly text", "*.asm *.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            updated = self.parser.import_full_asm(path)
+            self.refresh_tree()
+            self.show_overview()
+            self.preview.set_shader(self.parser)
+            self.refresh_cfg(redraw_only=True)
+            self._set_status(f"Imported full ASM: updated {updated} instruction(s). Save to write them to disk.")
+        except Exception as exc:
+            messagebox.showerror("Full ASM import failed", str(exc))
+
+    def _parse_symbol_scope(self, text: Optional[str] = None) -> Optional[int]:
+        scope = (self.symbol_dvle_var.get() if text is None else str(text)).strip().lower()
+        if scope in {"", "global", "all", "none"}:
+            return None
+        if scope.startswith("dvle:"):
+            scope = scope.split(":", 1)[1]
+        return int(scope, 0)
+
+    def _active_dvle_for_instruction(self, inst_idx: Optional[int] = None) -> Optional[int]:
+        if inst_idx is None:
+            inst_idx = self.selected_instruction
+        if inst_idx is None:
+            return None
+        for dvle in self.parser.dvles:
+            if self.parser._instruction_in_dvle_range(int(inst_idx), dvle):
+                return dvle.index
+        try:
+            dvle_idx = int(self.cfg_dvle_var.get().strip() or "0", 0)
+            if 0 <= dvle_idx < len(self.parser.dvles):
+                return dvle_idx
+        except Exception:
+            pass
+        return 0 if self.parser.dvles else None
+
+    def _labels_for_dvle(self, dvle_idx: Optional[int]) -> Dict[str, int]:
+        if dvle_idx is None or not (0 <= int(dvle_idx) < len(self.parser.dvles)):
+            return {}
+        dvle = self.parser.dvles[int(dvle_idx)]
+        labels: Dict[str, int] = {}
+        for lab in dvle.labels:
+            name = self.parser._label_display_name(lab)
+            if name:
+                labels[name] = lab.opcode_address
+                labels[name.replace(" ", "_")] = lab.opcode_address
+        return labels
+
+    def _symbol_map_for_instruction(self, inst_idx: Optional[int] = None) -> Dict[str, str]:
+        return self.parser.symbol_to_register_map(self._active_dvle_for_instruction(inst_idx))
+
+    @staticmethod
+    def _add_symbol_binding(symbol_map: Dict[str, str], symbol: str, register: str, *, prefer: bool = False) -> None:
+        sym = str(symbol or "").strip()
+        reg = native_register_from_display(register)
+        if not sym or not reg:
+            return
+
+        def add_one(name: str) -> None:
+            if not name:
+                return
+            if prefer:
+                symbol_map[name] = reg
+                symbol_map[name.replace(" ", "_")] = reg
+            else:
+                symbol_map.setdefault(name, reg)
+                symbol_map.setdefault(name.replace(" ", "_"), reg)
+
+        add_one(sym)
+        stem, component_suffix = split_vector_component_suffix(sym)
+        if component_suffix and stem and stem != sym:
+            add_one(stem)
+
+    def _symbol_map_for_asm_roundtrip(self, inst_idx: int, dvle_idx: Optional[int]) -> Dict[str, str]:
+        merged: Dict[str, str] = {}
+        if self.parser.dvlp and 0 <= int(inst_idx) < len(self.parser.dvlp.instructions):
+            inst = self.parser.dvlp.instructions[int(inst_idx)]
+            for ann in inst.fields.get("register_annotations", []) or []:
+                self._add_symbol_binding(merged, ann.get("symbol", ""), ann.get("register", ""), prefer=True)
+        for sym, reg in self.parser.symbol_to_register_map(dvle_idx).items():
+            self._add_symbol_binding(merged, sym, reg, prefer=False)
+        return merged
+
+    def _resolve_register_field(self, text: str, kind: str = "src", inst_idx: Optional[int] = None) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return raw
+        display = native_register_from_display(raw)
+        if display != raw.lower():
+            return display
+        dvle_idx = self._active_dvle_for_instruction(inst_idx) if inst_idx is not None else None
+        symbols = self._symbol_map_for_asm_roundtrip(inst_idx, dvle_idx) if inst_idx is not None else self._symbol_map_for_instruction()
+        low_map = {str(k).lower(): v for k, v in symbols.items()}
+        if raw in symbols:
+            return symbols[raw]
+        if raw.lower() in low_map:
+            return low_map[raw.lower()]
+        return raw
+
+    def _display_register_field(self, register: str, dvle_idx: Optional[int]) -> str:
+        return self.parser.register_display_name(register, dvle_idx)
+
+    def _instruction_format_from_editor(self, inst_idx: Optional[int] = None) -> Tuple[Optional[int], str]:
+        mnemonic = self.instr_mnemonic_var.get().strip().upper() if hasattr(self, "instr_mnemonic_var") else ""
+        if mnemonic in MNEMONIC_TO_OPCODE:
+            op = MNEMONIC_TO_OPCODE[mnemonic]
+            return op, pica_instruction_format(op, is_word=False)
+        if inst_idx is not None and self.parser.dvlp and 0 <= int(inst_idx) < len(self.parser.dvlp.instructions):
+            inst = self.parser.dvlp.instructions[int(inst_idx)]
+            return inst.opcode, inst.fmt
+        return None, "unknown"
+
+    def _used_instruction_dropdowns(self, opcode: Optional[int], fmt: str) -> set[str]:
+        used: set[str] = set()
+        if fmt in {"1", "1i"}:
+            used.update({"DST", "SRC1", "SRC2"})
+        elif fmt == "1u":
+            used.update({"DST", "SRC1"})
+        elif fmt == "1c":
+            used.update({"SRC1", "SRC2", "CmpX", "CmpY"})
+        elif fmt == "2":
+            # CALL is unconditional. The other format-2 flow ops use cond/ref bits.
+            if opcode in {0x23, 0x25, 0x28, 0x2C}:
+                used.add("CondOp")
+        elif fmt == "3":
+            # IFU/CALLU/JMPU use bN; LOOP uses iN.
+            used.add("Bool/Int ID")
+        elif fmt in {"5", "5i"}:
+            used.update({"DST", "SRC1", "SRC2", "SRC3"})
+        return used
+
+    def _refresh_instruction_register_choices(self, inst_idx: Optional[int] = None) -> None:
+        if not hasattr(self, "instr_register_widgets"):
+            return
+        dvle_idx = self._active_dvle_for_instruction(inst_idx)
+        opcode, fmt = self._instruction_format_from_editor(inst_idx)
+        used_dropdowns = self._used_instruction_dropdowns(opcode, fmt)
+
+        def src_slot_kind(label: str) -> str:
+            # PICA has mixed 5-bit and 7-bit source fields. Only 7-bit fields can hold cN constants.
+            if fmt in {"1", "1u", "1c"}:
+                return "src" if label == "SRC1" else "src5"
+            if fmt == "1i":
+                return "src5" if label == "SRC1" else "src"
+            if fmt == "5":
+                return "src" if label == "SRC2" else "src5"
+            if fmt == "5i":
+                return "src" if label == "SRC3" else "src5"
+            return "src"
+
+        for label, combo in self.instr_register_widgets.items():
+            if label == "DST":
+                combo.configure(values=self.parser.register_display_choices(dvle_idx, "dst"))
+            elif label in {"SRC1", "SRC2", "SRC3"}:
+                combo.configure(values=self.parser.register_display_choices(dvle_idx, src_slot_kind(label)))
+            elif label == "Bool/Int ID":
+                combo.configure(values=self.parser.register_display_choices(dvle_idx, "uniform"))
+            elif label == "CondOp":
+                combo.configure(values=[CONDOP_NAMES[i] for i in sorted(CONDOP_NAMES)])
+            elif label in {"CmpX", "CmpY"}:
+                combo.configure(values=[CMP_OP_NAMES[i] for i in sorted(CMP_OP_NAMES)])
+
+            combo.configure(state="normal" if label in used_dropdowns else "disabled")
+
+
+    def _refresh_symbol_editor_choices(self) -> None:
+        if self.symbol_scope_combo is not None:
+            scopes = ["global"] + [str(dvle.index) for dvle in self.parser.dvles]
+            self.symbol_scope_combo.configure(values=scopes)
+        if self.symbol_register_combo is not None:
+            dvle_idx = self._parse_symbol_scope()
+            choices = []
+            choices.extend(self.parser.register_display_choices(dvle_idx, "src"))
+            choices.extend(self.parser.register_display_choices(dvle_idx, "dst"))
+            choices.extend(self.parser.register_display_choices(dvle_idx, "uniform"))
+            seen = set()
+            unique = []
+            for choice in choices:
+                key = native_register_from_display(choice)
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(choice)
+            self.symbol_register_combo.configure(values=unique)
+
+    def _detected_symbol_rows(self) -> List[Tuple[str, str, str, str]]:
+        rows: List[Tuple[str, str, str, str]] = []
+        for dvle in self.parser.dvles:
+            scope = str(dvle.index)
+            for inp in dvle.inputs:
+                lo, hi = sorted((inp.start, inp.end))
+                for reg_num in range(lo, hi + 1):
+                    name = inp.name if lo == hi else f"{inp.name}[{reg_num - lo}]"
+                    if name:
+                        rows.append((scope, f"v{reg_num}", name, "Input Register Table"))
+            for out in dvle.outputs:
+                rows.append((scope, f"o{out.register_id}", OUTPUT_TYPES.get(out.output_type, f"output_{out.output_type}"), "Output Register Table"))
+            for c in dvle.constants:
+                if c.display_name and c.display_name != c.register_name:
+                    rows.append((scope, c.register_name, c.display_name, "Constant Table"))
+        return rows
+
+    def refresh_symbol_table(self) -> None:
+        if self.symbol_tree is None:
+            return
+        self.symbol_tree.delete(*self.symbol_tree.get_children())
+        maps = self.parser._symbol_maps()
+        for scope, regs in sorted(maps.items()):
+            shown_scope = "global" if scope == "global" else scope.split(":", 1)[-1]
+            for reg, sym in sorted(regs.items()):
+                if not sym:
+                    continue
+                iid = f"alias:{shown_scope}:{reg}"
+                self.symbol_tree.insert("", "end", iid=iid, values=(shown_scope, reg, sym, "User Alias"))
+        for i, (scope, reg, sym, source) in enumerate(self._detected_symbol_rows()):
+            iid = f"detected:{i}"
+            self.symbol_tree.insert("", "end", iid=iid, values=(scope, reg, sym, source))
+        self._refresh_symbol_editor_choices()
+
+    def load_selected_symbol_row(self) -> None:
+        if self.symbol_tree is None:
+            return
+        sel = self.symbol_tree.selection()
+        if not sel:
+            return
+        vals = self.symbol_tree.item(sel[0], "values")
+        if len(vals) >= 3:
+            self.symbol_dvle_var.set(str(vals[0]))
+            self.symbol_register_var.set(str(vals[1]))
+            self.symbol_name_var.set(str(vals[2]))
+            self._refresh_symbol_editor_choices()
+
+    def on_symbol_table_select(self, _event: Any = None) -> None:
+        self.load_selected_symbol_row()
+
+    def delete_register_alias(self) -> None:
+        if not self._require_loaded():
+            return
+        try:
+            dvle_idx = self._parse_symbol_scope()
+            self.parser.remove_register_alias(self.symbol_register_var.get(), dvle_idx)
+            self.refresh_tree()
+            self.show_symbol_tools()
+            self.preview.set_shader(self.parser)
+            self._set_status("Register alias deleted from the symbol map.")
+        except Exception as exc:
+            messagebox.showerror("Delete alias failed", str(exc))
+
+    def export_symbol_map(self) -> None:
+        if not self._require_loaded():
+            return
+        default = Path(self.parser.filename).with_suffix(".register_symbols.json").name if self.parser.filename else "register_symbols.json"
+        path = filedialog.asksaveasfilename(initialfile=default, defaultextension=".json", filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            self.parser.export_register_symbol_map(path)
+            self.show_symbol_tools()
+            self._set_status(f"Exported register symbol map to {os.path.basename(path)}.")
+        except Exception as exc:
+            messagebox.showerror("Symbol map export failed", str(exc))
+
+    def import_symbol_map(self) -> None:
+        if not self._require_loaded():
+            return
+        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            count = self.parser.import_register_symbol_map(path)
+            self.refresh_tree()
+            self.show_symbol_tools()
+            self.preview.set_shader(self.parser)
+            self._set_status(f"Imported {count} register symbol alias(es).")
+        except Exception as exc:
+            messagebox.showerror("Symbol map import failed", str(exc))
+
+    def show_symbol_tools(self) -> None:
+        if not self._require_loaded():
+            return
+        self.refresh_symbol_table()
+        lines = ["Register Symbol Map", ""]
+        maps = self.parser._symbol_maps()
+        for scope, regs in maps.items():
+            lines.append(f"[{scope}]")
+            if regs:
+                for reg, sym in sorted(regs.items()):
+                    lines.append(f"  {reg:6} = {sym}")
+            else:
+                lines.append("  <empty>")
+            lines.append("")
+        lines.append("Detected register-backed symbols available to ASM/dropdowns:")
+        for scope, reg, sym, source in self._detected_symbol_rows():
+            lines.append(f"  DVLE {scope:>2}  {reg:<6} = {sym}  [{source}]")
+        self.symbol_text.configure(state=tk.NORMAL)
+        self.symbol_text.delete("1.0", tk.END)
+        self.symbol_text.insert(tk.END, "\n".join(lines))
+        self.symbol_text.configure(state=tk.DISABLED)
+        self.notebook.select(self.symbol_frame)
+
+    def apply_register_alias(self) -> None:
+        if not self._require_loaded():
+            return
+        try:
+            dvle_idx = self._parse_symbol_scope()
+            self.parser.set_register_alias(self.symbol_register_var.get(), self.symbol_name_var.get(), dvle_idx)
+            self.refresh_tree()
+            self.show_symbol_tools()
+            self._refresh_instruction_register_choices()
+            self.preview.set_shader(self.parser)
+            self._set_status("Register alias applied to the symbol map.")
+        except Exception as exc:
+            messagebox.showerror("Alias failed", str(exc))
+
+    def show_register_lifetimes(self) -> None:
+        if not self._require_loaded():
+            return
+        try:
+            dvle_idx = int(self.analysis_dvle_var.get().strip() or self.cfg_dvle_var.get().strip() or "0", 0)
+        except Exception:
+            dvle_idx = 0
+        self.analysis_dvle_var.set(str(dvle_idx))
+        self._set_text(self.analysis_text, self.parser.register_lifetime_report(dvle_idx))
+        self.notebook.select(self.analysis_text.master)
+
+    def refresh_cfg(self, redraw_only: bool = False) -> None:
+        if not hasattr(self, "cfg_canvas"):
+            return
+        self.cfg_canvas.delete("all")
+        if not self.parser.loaded or not self.parser.dvlp:
+            self.cfg_canvas.create_text(24, 24, anchor=tk.NW, text="Open a shader to view the control-flow graph.", fill="#d0d7e2", font=("Segoe UI", 11, "bold"))
+            return
+        try:
+            dvle_idx = int(self.cfg_dvle_var.get().strip() or "0", 0)
+        except Exception:
+            dvle_idx = 0
+            self.cfg_dvle_var.set("0")
+        graph = self.parser.control_flow_graph(dvle_idx)
+        nodes = graph.get("nodes", [])
+        edges = graph.get("edges", [])
+        w = max(600, int(self.cfg_canvas.winfo_width()))
+        h = max(420, int(self.cfg_canvas.winfo_height()))
+        self.cfg_canvas.create_rectangle(0, 0, w, h, fill="#10141b", outline="")
+        if not nodes:
+            self.cfg_canvas.create_text(24, 24, anchor=tk.NW, text="No graph nodes decoded.", fill="#d0d7e2")
+            return
+        node_w, node_h = 220, 54
+        x_gap = max(40, (w - node_w) // 2)
+        y_gap = 88
+        positions: Dict[int, Tuple[int, int]] = {}
+        for i, node in enumerate(nodes):
+            x = x_gap + (40 if i % 2 else -40)
+            y = 30 + i * y_gap
+            positions[int(node["start"])] = (x, y)
+        for edge in edges:
+            src = int(edge.get("from", 0)); dst = int(edge.get("to", 0))
+            if src not in positions:
+                continue
+            dst_start = dst if dst in positions else next((int(n["start"]) for n in nodes if int(n["start"]) >= dst), None)
+            if dst_start is None or dst_start not in positions:
+                continue
+            x1, y1 = positions[src]
+            x2, y2 = positions[dst_start]
+            sx, sy = x1 + node_w // 2, y1 + node_h
+            tx, ty = x2 + node_w // 2, y2
+            color = "#6fb2ff" if edge.get("kind") != "fallthrough" else "#73808f"
+            self.cfg_canvas.create_line(sx, sy, tx, ty, fill=color, arrow=tk.LAST, width=2, smooth=True)
+            self.cfg_canvas.create_text((sx + tx) / 2 + 8, (sy + ty) / 2, text=str(edge.get("kind", "")), fill=color, anchor=tk.W, font=("Segoe UI", 8))
+        for node in nodes:
+            x, y = positions[int(node["start"])]
+            label = f"{node.get('label')}\n{int(node['start']):04d}..{int(node['end']):04d}"
+            self.cfg_canvas.create_rectangle(x, y, x + node_w, y + node_h, fill="#1b2533", outline="#86a8d8", width=2)
+            self.cfg_canvas.create_text(x + 10, y + 8, anchor=tk.NW, text=label, fill="#eef5ff", font=("Consolas", 10, "bold"))
+        if not redraw_only:
+            self.notebook.select(self.cfg_frame)
+        self._set_status(f"Control-flow graph refreshed for DVLE {graph.get('dvle', dvle_idx)}: {len(nodes)} block(s), {len(edges)} edge(s).")
+
     def show_validation(self) -> None:
         if not self._require_loaded():
             return
@@ -2594,6 +4043,7 @@ class App(tk.Tk):
             return
 
         needle = self.filter_var.get().strip().lower()
+        terms = [t for t in needle.split() if t]
 
         root = self.tree.insert("", "end", iid="dvlb", text="DVLB Header", values=("Header", f"{len(self.parser.dvles)} DVLE(s)"), open=True)
         self.item_ranges["dvlb"] = (0, min(0x40, len(self.parser.data)))
@@ -2632,16 +4082,17 @@ class App(tk.Tk):
                     self.item_ranges[block_id] = (inst.offset, 4)
 
                 hay = " ".join([inst.disasm, str(ann_disasm), labels_here, current_block_hay, inst.mnemonic, inst.fmt, f"0x{inst.word:08X}"]).lower()
-                if needle and needle not in hay:
+                if terms and not all(term in hay for term in terms):
                     continue
 
                 item_id = f"inst:{inst.index}"
+                display_disasm = str(ann_disasm)
                 self.tree.insert(
                     current_block_parent,
                     "end",
                     iid=item_id,
-                    text=f"{inst.index:04d}: {inst.mnemonic}",
-                    values=(inst.fmt, str(ann_disasm)),
+                    text=f"{inst.index:04d}: {display_disasm}",
+                    values=(inst.fmt, f"0x{inst.word:08X}"),
                 )
                 self.item_ranges[item_id] = (inst.offset, 4)
 
@@ -2651,7 +4102,7 @@ class App(tk.Tk):
                 dec = pica_decode_opdesc(desc, flags)
                 info = f"mask={dec['dest_mask']} s1={'-' if dec['src1_neg'] else ''}{dec['src1_swizzle']} s2={'-' if dec['src2_neg'] else ''}{dec['src2_swizzle']} s3={'-' if dec['src3_neg'] else ''}{dec['src3_swizzle']}"
                 hay = f"opdesc {i} 0x{desc:08x} 0x{flags:08x} {info}".lower()
-                if needle and needle not in hay:
+                if terms and not all(term in hay for term in terms):
                     continue
                 item_id = f"opdesc:{i}"
                 self.tree.insert(opdesc_parent, "end", iid=item_id, text=f"Opdesc {i:03d}", values=("Opdesc", info))
@@ -2672,8 +4123,8 @@ class App(tk.Tk):
             const_parent = self.tree.insert(dvle_item, "end", iid=f"dvle:{dvle.index}:constants", text="Constants", values=("Table", f"{len(dvle.constants)} entries"), open=True)
             self.item_ranges[f"dvle:{dvle.index}:constants"] = (dvle.offset + dvle.const_offset, dvle.const_count * 0x14)
             for c in dvle.constants:
-                hay = " ".join([c.display_name, c.register_name, c.type_name, str(c.values_for_display)]).lower()
-                if needle and needle not in hay:
+                hay = " ".join([c.display_name, c.register_name, self.parser.register_alias(c.register_name, dvle.index), c.type_name, str(c.values_for_display)]).lower()
+                if terms and not all(term in hay for term in terms):
                     continue
                 preview = self._constant_preview(c)
                 item_id = f"const:{dvle.index}:{c.index}"
@@ -2684,7 +4135,7 @@ class App(tk.Tk):
             self.item_ranges[f"dvle:{dvle.index}:inputs"] = (dvle.offset + dvle.input_offset, dvle.input_count * 8)
             for inp in dvle.inputs:
                 hay = f"{inp.name} 0x{inp.start:02x} 0x{inp.end:02x} input register table".lower()
-                if needle and needle not in hay:
+                if terms and not all(term in hay for term in terms):
                     continue
                 item_id = f"input:{dvle.index}:{inp.index}"
                 self.tree.insert(inputs_parent, "end", iid=item_id, text=inp.name or f"input_{inp.index}", values=("Input", f"regs 0x{inp.start:02X}..0x{inp.end:02X}"))
@@ -2695,7 +4146,7 @@ class App(tk.Tk):
             for out in dvle.outputs:
                 type_name = OUTPUT_TYPES.get(out.output_type, f"unknown_{out.output_type}")
                 hay = f"{type_name} o{out.register_id} {component_mask(out.mask)} output register table".lower()
-                if needle and needle not in hay:
+                if terms and not all(term in hay for term in terms):
                     continue
                 item_id = f"output:{dvle.index}:{out.index}"
                 self.tree.insert(outputs_parent, "end", iid=item_id, text=type_name, values=("Output", f"o{out.register_id} mask={component_mask(out.mask)}"))
@@ -2706,7 +4157,7 @@ class App(tk.Tk):
             for lab in dvle.labels:
                 label_name = self.parser._label_display_name(lab)
                 hay = f"{label_name} {lab.label_id} {lab.opcode_address} label table".lower()
-                if needle and needle not in hay:
+                if terms and not all(term in hay for term in terms):
                     continue
                 item_id = f"label:{dvle.index}:{lab.index}"
                 self.tree.insert(labels_parent, "end", iid=item_id, text=label_name, values=("Label", f"id={lab.label_id} target={lab.opcode_address}"))
@@ -2716,7 +4167,7 @@ class App(tk.Tk):
             self.item_ranges[f"dvle:{dvle.index}:symbols"] = (dvle.offset + dvle.symbol_offset, dvle.symbol_size)
             for sym_i, (rel, text) in enumerate(dvle.symbols):
                 hay = f"{text} 0x{rel:04x} symbol table".lower()
-                if needle and needle not in hay:
+                if terms and not all(term in hay for term in terms):
                     continue
                 item_id = f"symbol:{dvle.index}:{sym_i}"
                 self.tree.insert(symbols_parent, "end", iid=item_id, text=text or f"symbol_{sym_i}", values=("Symbol", f"rel=0x{rel:04X}"))
@@ -3238,23 +4689,30 @@ class App(tk.Tk):
         self._set_text(self.raw_text, self._raw_table_for_item(f"inst:{inst_idx}"))
 
         self.instr_header_label.configure(text=f"Instruction {inst.index}: {f.get('annotated_disasm', inst.disasm)}")
+        dvle_idx = self._active_dvle_for_instruction(inst.index)
         self.instr_raw_var.set(f"0x{inst.word:08X}")
         self.instr_mnemonic_var.set(inst.mnemonic)
-        self.instr_asm_var.set(inst.disasm)
+        self.instr_asm_var.set(str(annotated))
         self.instr_desc_var.set(str(f.get("desc_id", 0)))
-        self.instr_dst_var.set(str(f.get("dst", "r0")))
-        self.instr_src1_var.set(str(f.get("src1", "v0")))
-        self.instr_src2_var.set(str(f.get("src2", "v0")))
-        self.instr_src3_var.set(str(f.get("src3", "v0")))
+        self.instr_dst_var.set(self._display_register_field(str(f.get("dst", "r0")), dvle_idx))
+        self.instr_src1_var.set(self._display_register_field(str(f.get("src1", "v0")), dvle_idx))
+        self.instr_src2_var.set(self._display_register_field(str(f.get("src2", "v0")), dvle_idx))
+        self.instr_src3_var.set(self._display_register_field(str(f.get("src3", "v0")), dvle_idx))
         self.instr_idx_var.set(str(f.get("idx", 0)))
         self.instr_num_var.set(str(f.get("num", 0)))
         self.instr_target_var.set(str(f.get("target", 0)))
-        self.instr_condop_var.set(str(f.get("condop", 0)))
-        self.instr_boolint_var.set(str(f.get("uniform_id", 0)))
+        self.instr_condop_var.set(str(f.get("condop_name", f.get("condop", 0))))
+        uid = int(f.get("uniform_id", 0) or 0)
+        if "uniform_id" in f:
+            uniform_reg = ("i" if inst.opcode == 0x29 else "b") + str(uid)
+            self.instr_boolint_var.set(self._display_register_field(uniform_reg, dvle_idx))
+        else:
+            self.instr_boolint_var.set(str(uid))
         self.instr_refx_var.set(str(f.get("refx", 0)))
         self.instr_refy_var.set(str(f.get("refy", 0)))
-        self.instr_cmpx_var.set(str(f.get("cmpx", 0)))
-        self.instr_cmpy_var.set(str(f.get("cmpy", 0)))
+        self.instr_cmpx_var.set(str(f.get("cmpx_name", f.get("cmpx", 0))))
+        self.instr_cmpy_var.set(str(f.get("cmpy_name", f.get("cmpy", 0))))
+        self._refresh_instruction_register_choices(inst.index)
         self.notebook.select(2)
 
     def show_opdesc(self, opdesc_idx: int) -> None:
@@ -3305,6 +4763,7 @@ class App(tk.Tk):
                   self.instr_idx_var, self.instr_num_var, self.instr_target_var, self.instr_condop_var,
                   self.instr_boolint_var, self.instr_refx_var, self.instr_refy_var, self.instr_cmpx_var, self.instr_cmpy_var]:
             v.set("")
+        self._refresh_instruction_register_choices(None)
 
     def _clear_opdesc_tab(self) -> None:
         if hasattr(self, "opdesc_header_label"):
@@ -3356,23 +4815,24 @@ class App(tk.Tk):
             if not self.parser.dvlp:
                 return
             base_word = self.parser.dvlp.instructions[inst_idx].word
+            labels = self._labels_for_dvle(self._active_dvle_for_instruction(inst_idx))
             word = pica_build_instruction_word(
                 self.instr_mnemonic_var.get(),
                 base_word=base_word,
                 desc_id=int(self.instr_desc_var.get().strip() or "0", 0),
-                dst=self.instr_dst_var.get().strip() or "r0",
-                src1=self.instr_src1_var.get().strip() or "v0",
-                src2=self.instr_src2_var.get().strip() or "v0",
-                src3=self.instr_src3_var.get().strip() or "v0",
+                dst=self._resolve_register_field(self.instr_dst_var.get().strip() or "r0", "dst", inst_idx),
+                src1=self._resolve_register_field(self.instr_src1_var.get().strip() or "v0", "src", inst_idx),
+                src2=self._resolve_register_field(self.instr_src2_var.get().strip() or "v0", "src", inst_idx),
+                src3=self._resolve_register_field(self.instr_src3_var.get().strip() or "v0", "src", inst_idx),
                 idx=int(self.instr_idx_var.get().strip() or "0", 0),
                 num=int(self.instr_num_var.get().strip() or "0", 0),
-                target=int(self.instr_target_var.get().strip() or "0", 0),
-                condop=int(self.instr_condop_var.get().strip() or "0", 0),
+                target=parse_target_token(self.instr_target_var.get().strip() or "0", labels),
+                condop=parse_condop(self.instr_condop_var.get().strip() or "0"),
                 refx=int(self.instr_refx_var.get().strip() or "0", 0),
                 refy=int(self.instr_refy_var.get().strip() or "0", 0),
-                uniform_id=int(self.instr_boolint_var.get().strip() or "0", 0),
-                cmpx=int(self.instr_cmpx_var.get().strip() or "0", 0),
-                cmpy=int(self.instr_cmpy_var.get().strip() or "0", 0),
+                uniform_id=parse_uniform_token(self._resolve_register_field(self.instr_boolint_var.get().strip() or "0", "uniform", inst_idx)),
+                cmpx=parse_cmpop(self.instr_cmpx_var.get().strip() or "0"),
+                cmpy=parse_cmpop(self.instr_cmpy_var.get().strip() or "0"),
             )
             self.parser.update_opcode_word(inst_idx, word)
             self._refresh_after_instruction_edit(inst_idx)
@@ -3384,22 +4844,18 @@ class App(tk.Tk):
             inst_idx = self._current_instruction_index()
             if not self.parser.dvlp:
                 return
-            mnemonic, instr_fields, opdesc_fields = parse_arithmetic_asm_line(self.instr_asm_var.get())
             existing = self.parser.dvlp.instructions[inst_idx]
             desc_id = int(existing.fields.get("desc_id", 0))
-            instr_fields.setdefault("desc_id", desc_id)
-            word = pica_build_instruction_word(
-                mnemonic,
+            dvle_idx = self._active_dvle_for_instruction(inst_idx)
+            word, opdesc_fields = parse_general_asm_line(
+                self.instr_asm_var.get(),
                 base_word=existing.word,
-                desc_id=desc_id,
-                dst=instr_fields.get("dst", "r0"),
-                src1=instr_fields.get("src1", "v0"),
-                src2=instr_fields.get("src2", "v0"),
-                src3=instr_fields.get("src3", "v0"),
-                idx=instr_fields.get("idx", 0),
+                default_desc_id=desc_id,
+                labels=self._labels_for_dvle(dvle_idx),
+                symbol_to_register=self._symbol_map_for_asm_roundtrip(inst_idx, dvle_idx),
             )
             self.parser.update_opcode_word(inst_idx, word)
-            if 0 <= desc_id < self.parser.dvlp.opdesc_count:
+            if opdesc_fields is not None and 0 <= desc_id < self.parser.dvlp.opdesc_count:
                 old_desc, old_flags = self.parser.dvlp.opdescs[desc_id]
                 desc, flags = pica_encode_opdesc(
                     opdesc_fields.get("mask", "xyzw"),
@@ -3415,6 +4871,40 @@ class App(tk.Tk):
             self._refresh_after_instruction_edit(inst_idx)
         except Exception as exc:
             messagebox.showerror("ASM patch failed", str(exc))
+
+
+    def insert_nop_before_selected(self) -> None:
+        try:
+            inst_idx = self._current_instruction_index()
+            if not messagebox.askyesno("Insert NOP", "This shifts opcode words down inside the existing opcode table and drops the last opcode. Continue?"):
+                return
+            self.parser.insert_nop_instruction(inst_idx)
+            self._refresh_after_instruction_edit(inst_idx)
+        except Exception as exc:
+            messagebox.showerror("Insert instruction failed", str(exc))
+
+    def delete_selected_instruction(self) -> None:
+        try:
+            inst_idx = self._current_instruction_index()
+            if not messagebox.askyesno("Delete instruction", "This shifts following opcode words up and fills the final slot with NOP. Continue?"):
+                return
+            self.parser.delete_instruction_shift_up(inst_idx)
+            self._refresh_after_instruction_edit(min(inst_idx, max(0, self.parser.dvlp.opcode_count - 1 if self.parser.dvlp else 0)))
+        except Exception as exc:
+            messagebox.showerror("Delete instruction failed", str(exc))
+
+    def add_asm_instruction_to_active_dvle(self) -> None:
+        if not self._require_loaded():
+            return
+        asm = simpledialog.askstring("Add ASM instruction", "ASM to insert before the active DVLE end marker:", initialvalue=self.instr_asm_var.get() or "nop")
+        if not asm:
+            return
+        try:
+            dvle_idx = self.preview.current_dvle_index if hasattr(self, "preview") and self.preview.current_dvle_index is not None else 0
+            idx = self.parser.add_instruction_at_end_of_range(int(dvle_idx), asm)
+            self._refresh_after_instruction_edit(idx)
+        except Exception as exc:
+            messagebox.showerror("Add instruction failed", str(exc))
 
     def apply_opdesc_raw(self) -> None:
         try:
